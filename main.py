@@ -30,6 +30,11 @@ def load_config():
                 "enabled": False,
                 "start": "22:00",
                 "end": "07:00"
+            },
+            "api": {
+                "enabled": False,
+                "host": "127.0.0.1",
+                "port": 8765
             }
         }
         # Note: above mistakenly uses a random salt for hash generation differently; fix to consistent salt below
@@ -45,6 +50,36 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2)
+
+
+def install_startup():
+    """Add app to HKCU Run so it starts at user logon."""
+    try:
+        import winreg
+        run_key_path = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key_path, 0, winreg.KEY_SET_VALUE) as key:
+            exe = sys.executable
+            script = str(Path(__file__).resolve())
+            cmd = f'"{exe}" "{script}"'
+            winreg.SetValueEx(key, 'PC-Lock', 0, winreg.REG_SZ, cmd)
+        print('Installed startup entry in HKCU Run.')
+    except Exception as e:
+        print(f'Failed to install startup entry: {e}')
+
+
+def uninstall_startup():
+    """Remove app from HKCU Run."""
+    try:
+        import winreg
+        run_key_path = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key_path, 0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, 'PC-Lock')
+                print('Removed startup entry from HKCU Run.')
+            except FileNotFoundError:
+                print('Startup entry not present.')
+    except Exception as e:
+        print(f'Failed to remove startup entry: {e}')
 
 
 def set_password_interactive():
@@ -159,18 +194,50 @@ def scheduler_loop(locker: Locker):
         time.sleep(1)
 
 
+def lock_if_in_schedule_now(locker: Locker):
+    cfg = load_config()
+    sched = cfg.get('schedule', {})
+    if not bool(sched.get('enabled', False)):
+        return
+    try:
+        start = dtime.fromisoformat(sched.get('start', '22:00'))
+        end = dtime.fromisoformat(sched.get('end', '07:00'))
+    except Exception:
+        return
+    if in_lock_window(datetime.now(), start, end):
+        locker.lock_now()
+
+
 
 def main():
+    from api import maybe_start_api
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--lock-now', action='store_true', help='Lock immediately and show lock screen')
     ap.add_argument('--set-password', action='store_true', help='Set or change the unlock password')
+    ap.add_argument('--install-startup', action='store_true', help='Install auto-start entry (current user)')
+    ap.add_argument('--uninstall-startup', action='store_true', help='Remove auto-start entry (current user)')
     args = ap.parse_args()
 
     if args.set_password:
         set_password_interactive()
         return
 
+    if args.install_startup:
+        install_startup()
+        return
+
+    if args.uninstall_startup:
+        uninstall_startup()
+        return
+
     locker = Locker()
+
+    # Start REST API if enabled in config
+    api_server = maybe_start_api(locker)
+
+    # Lock immediately if we're currently inside the scheduled window
+    lock_if_in_schedule_now(locker)
 
     if args.lock_now:
         locker.lock_now()
