@@ -1,0 +1,14 @@
+{
+  "hotkey": "ctrl+alt+u",
+  "password": {
+    "salt": "015ddeae1f33a6cb3365e0d1c542824d",
+    "hash": "afae2639b4ec45c1544e5d91099d4fa66071f9c9c909e7303dc34962b3e3c2c3",
+    "iterations": 200000,
+    "algo": "pbkdf2_sha256"
+  },
+  "schedule": {
+    "enabled": false,
+    "start": "22:00",
+    "end": "07:00"
+  }
+}
