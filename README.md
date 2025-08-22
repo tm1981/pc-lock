@@ -43,7 +43,7 @@ python ui.py
 ```
 
 - Click "Lock now" to test
-- Change schedule and click "Save schedule"
+- Change schedule and click "Save schedule" (you will be asked for the current password)
 - Change password requires the current password
 - Closing the window sends the app to the system tray. Use the tray icon to Open, Lock now, or Exit (password required).
 
@@ -81,6 +81,10 @@ Endpoints:
 - GET /api/status
   - Response: `{ "locked": true | false }`
 
+- POST /api/schedule
+  - Body: `{ "password": "your_password", "enabled": true, "start": "22:00", "end": "07:00" }`
+  - Response: `{ "schedule": { "enabled": true, "start": "22:00", "end": "07:00" } }`
+
 Examples (PowerShell):
 
 ```powershell
@@ -92,6 +96,9 @@ curl -Method POST -Uri http://127.0.0.1:8765/api/unlock -ContentType application
 
 # Status
 curl http://127.0.0.1:8765/api/status
+
+# Update schedule
+curl -Method POST -Uri http://127.0.0.1:8765/api/schedule -ContentType application/json -Body '{"password":"YOURPASS","enabled":true,"start":"22:00","end":"07:00"}'
 ```
 
 Security notes:
@@ -121,17 +128,33 @@ Edit `config.json`:
 - Time format is 24-hour `HH:MM` local time.
 - If `start` time is later than `end`, the lock window is considered overnight (e.g., 22:00–07:00 spans midnight).
 - API is disabled by default; enable to start a local REST server on launch (UI or console).
+- The schedule is stored securely (DPAPI) in `schedule.dat`; manual edits to `config.json` will not change the active schedule.
 
-## Build an .exe (optional)
+## Build a standalone .exe
 
-Use PyInstaller:
+We support a single self-contained exe using PyInstaller. It can run the console scheduler (default), the GUI, or the internal lock screen mode.
 
 ```powershell
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name pclock main.py
+# Optional: ensure tray deps
+pip install -r requirements.txt
+
+# Build icon asset
+python make_icon.py
+
+# Build single exe (embed the app icon and ship the tray icon asset)
+pyinstaller --noconfirm --onefile --windowed --name pclock --icon assets\pclock.ico --add-data assets\pclock.ico;assets main.py
 ```
 
-Run `dist\pclock.exe`. For scheduler mode, use a console build (omit `--windowed`) if you want logs visible.
+Run:
+- Double-click .\dist\pclock.exe (GUI launches by default on the exe)
+- Manual lock now (from exe):
+  - .\dist\pclock.exe --lock-now
+
+Notes:
+- The exe relaunches itself in an internal lock screen mode when needed (no external python files required).
+- The tray icon uses assets\pclock.ico when available; it is embedded via --add-data.
+- If Windows Firewall prompts when enabling API on 0.0.0.0, allow access for your network.
 
 ## Limitations
 - Secure Attention Sequence (Ctrl+Alt+Del), Win+L, and certain OS dialogs are protected by Windows and cannot be blocked by user applications.

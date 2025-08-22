@@ -2,59 +2,18 @@ import threading
 import time
 from datetime import datetime, time as dtime
 from pathlib import Path
-import json
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from secrets import token_bytes
-from hashlib import pbkdf2_hmac
+from config import load_config
 
 # System tray
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 import pystray
 
 # Reuse the Locker and helpers from main.py
 import main as core
 from api import maybe_start_api
-
-CONFIG_PATH = Path(__file__).with_name('config.json')
-
-
-def load_config():
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-def save_config(cfg):
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
-
-
-def verify_password(password: str) -> bool:
-    cfg = load_config()
-    pwcfg = cfg.get('password', {})
-    salt_hex = pwcfg.get('salt')
-    hash_hex = pwcfg.get('hash')
-    iterations = int(pwcfg.get('iterations', 200_000))
-    if not salt_hex or not hash_hex:
-        return False
-    salt = bytes.fromhex(salt_hex)
-    calc = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
-    return calc.hex() == hash_hex
-
-
-def set_password(old_pw: str, new_pw: str) -> bool:
-    if not verify_password(old_pw):
-        return False
-    cfg = load_config()
-    salt = token_bytes(16)
-    iter_cnt = int(cfg.get('password', {}).get('iterations', 200_000))
-    new_hash = pbkdf2_hmac('sha256', new_pw.encode('utf-8'), salt, iter_cnt).hex()
-    cfg.setdefault('password', {})['salt'] = salt.hex()
-    cfg['password']['hash'] = new_hash
-    cfg['password']['iterations'] = iter_cnt
-    cfg['password']['algo'] = 'pbkdf2_sha256'
-    save_config(cfg)
-    return True
+from config import load_config, save_config, verify_password, set_password, update_api
 
 
 def in_lock_window(now: datetime, start: dtime, end: dtime) -> bool:
@@ -74,8 +33,8 @@ class SchedulerThread(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                cfg = load_config()
-                sched = cfg.get('schedule', {})
+                from schedule_store import read_schedule
+                sched = read_schedule()
                 enabled = bool(sched.get('enabled', False))
                 if enabled:
                     try:
@@ -83,7 +42,7 @@ class SchedulerThread(threading.Thread):
                         end = dtime.fromisoformat(sched.get('end', '07:00'))
                         should_lock = in_lock_window(datetime.now(), start, end)
                         if should_lock and not self.locker.state.active:
-                            self.locker.lock_now()
+                            self.locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
                             if self.on_state_change:
                                 self.on_state_change(True)
                         elif not should_lock and self.locker.state.active:
@@ -108,7 +67,26 @@ class TrayManager:
         self.thread = threading.Thread(target=self.icon.run, daemon=True)
 
     def _build_icon(self):
-        # Create a simple lock icon
+        # Try load packaged icon first
+        try:
+            import sys, os
+            ico_path = None
+            if getattr(sys, 'frozen', False):
+                base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+                candidate = os.path.join(base, 'assets', 'pclock.ico')
+                if os.path.exists(candidate):
+                    ico_path = candidate
+            else:
+                from pathlib import Path
+                candidate = Path(__file__).with_name('assets') / 'pclock.ico'
+                if candidate.exists():
+                    ico_path = str(candidate)
+            if ico_path:
+                from PIL import Image
+                return Image.open(ico_path)
+        except Exception:
+            pass
+        # Fallback: draw a simple vector icon
         img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         # body
@@ -157,6 +135,9 @@ class AppUI:
         self.root.geometry('360x260')
         self.locker = core.Locker()
         self.status_var = tk.StringVar(value='Status: Unlocked')
+        # Internal flags
+        self._loading = False
+        self._schedule_dirty = False
 
         # UI layout
         pad = {'padx': 10, 'pady': 6}
@@ -171,11 +152,27 @@ class AppUI:
         self.start_var = tk.StringVar(value='22:00')
         self.end_var = tk.StringVar(value='07:00')
         ttk.Checkbutton(frm_sched, text='Enabled', variable=self.enabled_var).grid(row=0, column=0, sticky='w', **pad)
+        # Track unsaved changes to prevent tick() from overwriting user edits
+        self.enabled_var.trace_add('write', self._on_schedule_field_changed)
+        self.start_var.trace_add('write', self._on_schedule_field_changed)
+        self.end_var.trace_add('write', self._on_schedule_field_changed)
         ttk.Label(frm_sched, text='Start (HH:MM)').grid(row=1, column=0, sticky='w', **pad)
         ttk.Entry(frm_sched, textvariable=self.start_var, width=10).grid(row=1, column=1, sticky='w', **pad)
         ttk.Label(frm_sched, text='End (HH:MM)').grid(row=2, column=0, sticky='w', **pad)
         ttk.Entry(frm_sched, textvariable=self.end_var, width=10).grid(row=2, column=1, sticky='w', **pad)
         ttk.Button(frm_sched, text='Save schedule', command=self.on_save_schedule).grid(row=3, column=0, columnspan=2, sticky='e', **pad)
+
+        frm_api = ttk.LabelFrame(root, text='API')
+        frm_api.pack(fill='x', **pad)
+        self.api_enabled_var = tk.BooleanVar(value=False)
+        self.api_host_var = tk.StringVar(value='127.0.0.1')
+        self.api_port_var = tk.StringVar(value='8765')
+        ttk.Checkbutton(frm_api, text='Enable REST API', variable=self.api_enabled_var).grid(row=0, column=0, sticky='w', **pad)
+        ttk.Label(frm_api, text='Host').grid(row=1, column=0, sticky='w', **pad)
+        ttk.Entry(frm_api, textvariable=self.api_host_var, width=16).grid(row=1, column=1, sticky='w', **pad)
+        ttk.Label(frm_api, text='Port').grid(row=2, column=0, sticky='w', **pad)
+        ttk.Entry(frm_api, textvariable=self.api_port_var, width=8).grid(row=2, column=1, sticky='w', **pad)
+        ttk.Button(frm_api, text='Save API', command=self.on_save_api).grid(row=3, column=0, columnspan=2, sticky='e', **pad)
 
         frm_pw = ttk.LabelFrame(root, text='Password')
         frm_pw.pack(fill='x', **pad)
@@ -183,6 +180,9 @@ class AppUI:
 
         # Load initial config
         self.load_into_ui()
+
+        # If password not set, force setup
+        self.ensure_password_set()
 
         # Start scheduler thread
         self.scheduler = SchedulerThread(self.locker, on_state_change=self.update_status)
@@ -210,32 +210,46 @@ class AppUI:
 
     def load_into_ui(self):
         try:
-            cfg = load_config()
-            sched = cfg.get('schedule', {})
+            self._loading = True
+            from schedule_store import read_schedule
+            sched = read_schedule()
             self.enabled_var.set(bool(sched.get('enabled', False)))
             self.start_var.set(sched.get('start', '22:00'))
             self.end_var.set(sched.get('end', '07:00'))
+            # API
+            cfg = load_config()
+            api = cfg.get('api', {})
+            self.api_enabled_var.set(bool(api.get('enabled', False)))
+            self.api_host_var.set(str(api.get('host', '127.0.0.1')))
+            self.api_port_var.set(str(api.get('port', 8765)))
         except Exception:
             pass
+        finally:
+            self._loading = False
+            self._schedule_dirty = False
 
     def on_lock_now(self):
         try:
-            self.locker.lock_now()
+            self.locker.lock_now(reason='manual')
             self.update_status(True)
         except Exception as e:
             messagebox.showerror('Error', f'Failed to lock: {e}')
 
     def on_save_schedule(self):
         try:
+            # Require current password to save schedule
+            pw = simpledialog.askstring('Confirm', 'Enter password to save schedule:', show='*', parent=self.root)
+            if pw is None or not verify_password(pw):
+                messagebox.showerror('Error', 'Incorrect password. Schedule not saved.')
+                return
             # validate times
             start = dtime.fromisoformat(self.start_var.get())
             end = dtime.fromisoformat(self.end_var.get())
-            cfg = load_config()
-            cfg.setdefault('schedule', {})['enabled'] = bool(self.enabled_var.get())
-            cfg['schedule']['start'] = start.isoformat(timespec='minutes')
-            cfg['schedule']['end'] = end.isoformat(timespec='minutes')
-            save_config(cfg)
+            # Persist securely (DPAPI)
+            from schedule_store import write_schedule
+            write_schedule(bool(self.enabled_var.get()), start.isoformat(timespec='minutes'), end.isoformat(timespec='minutes'))
             messagebox.showinfo('Saved', 'Schedule updated.')
+            self._schedule_dirty = False
             # Optionally re-evaluate now
             self.lock_if_in_schedule_now()
         except Exception as e:
@@ -256,27 +270,92 @@ class AppUI:
         if confirm != new_pw:
             messagebox.showerror('Error', 'Passwords do not match.')
             return
-        if set_password(old_pw, new_pw):
+        try:
+            set_password(new_pw)
             messagebox.showinfo('Success', 'Password changed.')
-        else:
-            messagebox.showerror('Error', 'Failed to change password.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to change password: {e}')
 
     def lock_if_in_schedule_now(self):
         try:
-            cfg = load_config()
-            sched = cfg.get('schedule', {})
+            from schedule_store import read_schedule
+            sched = read_schedule()
             if not bool(sched.get('enabled', False)):
                 return
             start = dtime.fromisoformat(sched.get('start', '22:00'))
             end = dtime.fromisoformat(sched.get('end', '07:00'))
             if in_lock_window(datetime.now(), start, end):
-                self.locker.lock_now()
+                self.locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
                 self.update_status(True)
+        except Exception:
+            pass
+
+    def on_save_api(self):
+        try:
+            # Require current password to change API settings
+            pw = simpledialog.askstring('Confirm', 'Enter password to save API settings:', show='*', parent=self.root)
+            if pw is None or not verify_password(pw):
+                messagebox.showerror('Error', 'Incorrect password. API settings not saved.')
+                return
+            enabled = bool(self.api_enabled_var.get())
+            host = self.api_host_var.get().strip() or '127.0.0.1'
+            port = int(self.api_port_var.get().strip() or '8765')
+            update_api(enabled, host, port)
+            # restart server if needed
+            if self.api_server:
+                try:
+                    self.api_server.stop()
+                except Exception:
+                    pass
+                self.api_server = None
+            self.api_server = maybe_start_api(self.locker)
+            messagebox.showinfo('Saved', 'API settings updated.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Invalid API settings: {e}')
+
+    def ensure_password_set(self):
+        try:
+            cfg = load_config()
+            pwcfg = cfg.get('password', {})
+            if not pwcfg.get('salt') or not pwcfg.get('hash'):
+                while True:
+                    new_pw = simpledialog.askstring('Set password', 'Create a new unlock password:', show='*', parent=self.root)
+                    if new_pw is None:
+                        messagebox.showerror('Required', 'A password is required on first run.')
+                        continue
+                    if len(new_pw) < 4:
+                        messagebox.showerror('Error', 'Password must be at least 4 characters.')
+                        continue
+                    confirm = simpledialog.askstring('Set password', 'Confirm password:', show='*', parent=self.root)
+                    if confirm != new_pw:
+                        messagebox.showerror('Error', 'Passwords do not match.')
+                        continue
+                    set_password(new_pw)
+                    messagebox.showinfo('Success', 'Password set.')
+                    break
         except Exception:
             pass
 
     def tick(self):
         self.update_status()
+        # Sync schedule UI with secure store (handles external changes like auto-disable on unlock)
+        if not self._schedule_dirty:
+            try:
+                self._loading = True
+                from schedule_store import read_schedule
+                sched = read_schedule()
+                enabled = bool(sched.get('enabled', False))
+                if self.enabled_var.get() != enabled:
+                    self.enabled_var.set(enabled)
+                # Optionally sync times too
+                if self.start_var.get() != sched.get('start', '22:00'):
+                    self.start_var.set(sched.get('start', '22:00'))
+                if self.end_var.get() != sched.get('end', '07:00'):
+                    self.end_var.set(sched.get('end', '07:00'))
+            except Exception:
+                pass
+            finally:
+                self._loading = False
         self.root.after(1000, self.tick)
 
     def minimize_to_tray(self):
@@ -295,6 +374,11 @@ class AppUI:
             self.tray.hide()
         except Exception:
             pass
+
+    def _on_schedule_field_changed(self, *args):
+        if self._loading:
+            return
+        self._schedule_dirty = True
 
 
 if __name__ == '__main__':

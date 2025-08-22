@@ -6,50 +6,25 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from secrets import token_bytes
 from hashlib import pbkdf2_hmac
 
 import desktop
+import sys as _sys
 
 CONFIG_PATH = Path(__file__).with_name('config.json')
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        cfg = {
-            "hotkey": "ctrl+alt+u",
-            "password": {
-                "salt": token_bytes(16).hex(),
-                "hash": pbkdf2_hmac('sha256', b'ChangeMe123', token_bytes(16), 200_000).hex(),
-                "iterations": 200_000,
-                "algo": "pbkdf2_sha256",
-            },
-            "schedule": {
-                "enabled": False,
-                "start": "22:00",
-                "end": "07:00"
-            },
-            "api": {
-                "enabled": False,
-                "host": "127.0.0.1",
-                "port": 8765
-            }
-        }
-        # Note: above mistakenly uses a random salt for hash generation differently; fix to consistent salt below
-        salt = token_bytes(16)
-        cfg["password"]["salt"] = salt.hex()
-        cfg["password"]["hash"] = pbkdf2_hmac('sha256', b'ChangeMe123', salt, cfg["password"]["iterations"]).hex()
-        save_config(cfg)
-        return cfg
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    from config import load_config as _load
+    return _load()
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
+    from config import save_config as _save
+    return _save(cfg)
 
 
 def install_startup():
@@ -83,7 +58,6 @@ def uninstall_startup():
 
 
 def set_password_interactive():
-    cfg = load_config()
     print('Set a new unlock password:')
     while True:
         import getpass
@@ -95,16 +69,10 @@ def set_password_interactive():
         if len(p1) < 4:
             print('Password too short (min 4 chars).')
             continue
-        pwcfg = cfg.setdefault('password', {})
-        salt = token_bytes(16)
-        pwcfg['salt'] = salt.hex()
-        pwcfg['iterations'] = int(pwcfg.get('iterations', 200_000))
-        pwcfg['hash'] = pbkdf2_hmac('sha256', p1.encode('utf-8'), salt, pwcfg['iterations']).hex()
-        pwcfg['algo'] = 'pbkdf2_sha256'
-        save_config(cfg)
+        from config import set_password as _set
+        _set(p1)
         print('Password updated.')
         return
-
 
 def in_lock_window(now: datetime, start: dtime, end: dtime) -> bool:
     cur = now.time()
@@ -120,22 +88,100 @@ def in_lock_window(now: datetime, start: dtime, end: dtime) -> bool:
 class LockState:
     process: subprocess.Popen | None = None
     active: bool = False
+    reason: str | None = None
+    start: str | None = None
+    end: str | None = None
 
 
 class Locker:
     def __init__(self):
         self.state = LockState()
+        self._watch_thread = None
+        self.override_until: datetime | None = None
+        self._prev_muted: int | None = None
 
-    def lock_now(self):
+    def _watch_child(self, proc: subprocess.Popen):
+        try:
+            proc.wait()
+        except Exception:
+            pass
+        # If the same process is still referenced, mark as inactive
+        if self.state.process is proc:
+            # If current lock was schedule-initiated, disable schedule on manual unlock
+            try:
+                if self.state.reason == 'schedule':
+                    from schedule_store import read_schedule, write_schedule
+                    sched = read_schedule()
+                    if bool(sched.get('enabled', False)):
+                        write_schedule(False, sched.get('start', '22:00'), sched.get('end', '07:00'))
+            except Exception:
+                pass
+            # Clear state
+            self.state = LockState()
+
+    def _mute_system(self):
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            from ctypes import POINTER, cast
+            from comtypes import CLSCTX_ALL
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            current = int(volume.GetMute())
+            if self._prev_muted is None:
+                self._prev_muted = current
+            if current == 0:
+                volume.SetMute(1, None)
+        except Exception:
+            pass
+
+    def _restore_audio(self):
+        try:
+            if self._prev_muted is None:
+                return
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            from ctypes import POINTER, cast
+            from comtypes import CLSCTX_ALL
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMute(int(self._prev_muted), None)
+        except Exception:
+            pass
+        finally:
+            self._prev_muted = None
+
+    def lock_now(self, reason: str = 'manual', start: str | None = None, end: str | None = None):
         if self.state.active:
             return
+        # Mute audio (A1)
+        self._mute_system()
         # Create/open alternate desktop and spawn lockscreen process bound to it
         hdesk = desktop.create_or_open_desktop(desktop.LOCK_DESKTOP)
         # Keep the handle open in this process lifetime
         # Start child process
-        cmd = [sys.executable, str(Path(__file__).with_name('lockscreen.py')), '--desktop-name', desktop.LOCK_DESKTOP]
-        proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-        self.state = LockState(process=proc, active=True)
+        if getattr(_sys, 'frozen', False):
+            # Relaunch the same EXE in lockscreen mode
+            cmd = [sys.executable, '--mode', 'lockscreen', '--desktop-name', desktop.LOCK_DESKTOP, '--reason', reason]
+            if reason == 'schedule' and start and end:
+                cmd += ['--start', start, '--end', end]
+        else:
+            cmd = [sys.executable, str(Path(__file__).with_name('lockscreen.py')), '--desktop-name', desktop.LOCK_DESKTOP, '--reason', reason]
+            if reason == 'schedule' and start and end:
+                cmd += ['--start', start, '--end', end]
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        # Hide any console window for child on Windows
+        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            flags |= subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen(cmd, creationflags=flags)
+        self.state = LockState(process=proc, active=True, reason=reason, start=start, end=end)
+        # Start watcher to reset state when child exits (e.g., after password unlock)
+        try:
+            import threading
+            self._watch_thread = threading.Thread(target=self._watch_child, args=(proc,), daemon=True)
+            self._watch_thread.start()
+        except Exception:
+            pass
         # Do not close hdesk yet; keeping handle open ensures desktop persists
         # We intentionally leak hdesk here; the OS will clean up on exit.
 
@@ -164,39 +210,37 @@ class Locker:
                 self.state.process.terminate()
             except Exception:
                 pass
+        # Restore audio
+        self._restore_audio()
         self.state = LockState()
 
 
 
 def scheduler_loop(locker: Locker):
     while True:
-        cfg = load_config()
-        sched = cfg.get('schedule', {})
-        enabled = bool(sched.get('enabled', False))
-        if not enabled:
+        from schedule_store import read_schedule
+        sched = read_schedule()
+        if not bool(sched.get('enabled', False)):
             time.sleep(1)
             continue
         try:
-            start_str = sched.get('start', '22:00')
-            end_str = sched.get('end', '07:00')
-            start = dtime.fromisoformat(start_str)
-            end = dtime.fromisoformat(end_str)
+            start = dtime.fromisoformat(sched.get('start', '22:00'))
+            end = dtime.fromisoformat(sched.get('end', '07:00'))
         except Exception:
-            # Invalid schedule; skip
             time.sleep(5)
             continue
         now = datetime.now()
         should_lock = in_lock_window(now, start, end)
         if should_lock and not locker.state.active:
-            locker.lock_now()
+            locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
         elif not should_lock and locker.state.active:
             locker.unlock_now()
         time.sleep(1)
 
 
 def lock_if_in_schedule_now(locker: Locker):
-    cfg = load_config()
-    sched = cfg.get('schedule', {})
+    from schedule_store import read_schedule
+    sched = read_schedule()
     if not bool(sched.get('enabled', False)):
         return
     try:
@@ -205,18 +249,64 @@ def lock_if_in_schedule_now(locker: Locker):
     except Exception:
         return
     if in_lock_window(datetime.now(), start, end):
-        locker.lock_now()
+        locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
 
+
+
+def _ensure_single_instance():
+    """Ensure only one scheduler/GUI instance runs. Lock screen child is exempt.
+    Uses a named global mutex via Win32 API to avoid pywin32 dependency issues in packaged exe.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        CreateMutexW = kernel32.CreateMutexW
+        CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        CreateMutexW.restype = wintypes.HANDLE
+        GetLastError = kernel32.GetLastError
+        ERROR_ALREADY_EXISTS = 183
+        # Create a global mutex
+        name = 'Global\\PC_LOCK_SINGLETON'
+        hmutex = CreateMutexW(None, True, name)
+        if not hmutex:
+            return None
+        if GetLastError() == ERROR_ALREADY_EXISTS:
+            # Another instance is running – try to bring it to front
+            try:
+                FindWindowW = user32.FindWindowW
+                ShowWindow = user32.ShowWindow
+                SetForegroundWindow = user32.SetForegroundWindow
+                SW_SHOW = 5
+                hwnd = FindWindowW(None, 'PC Lock')
+                if hwnd:
+                    ShowWindow(hwnd, SW_SHOW)
+                    SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            sys.exit(0)
+        # Keep handle referenced so mutex stays held
+        return hmutex
+    except Exception:
+        return None
 
 
 def main():
     from api import maybe_start_api
 
     ap = argparse.ArgumentParser()
+    ap.add_argument('--mode', choices=['scheduler', 'lockscreen'], default='scheduler', help='Internal modes for packaged exe')
+    ap.add_argument('--ui', action='store_true', help='Launch GUI manager instead of console scheduler')
     ap.add_argument('--lock-now', action='store_true', help='Lock immediately and show lock screen')
     ap.add_argument('--set-password', action='store_true', help='Set or change the unlock password')
     ap.add_argument('--install-startup', action='store_true', help='Install auto-start entry (current user)')
     ap.add_argument('--uninstall-startup', action='store_true', help='Remove auto-start entry (current user)')
+    # passthrough for lockscreen mode
+    ap.add_argument('--desktop-name', default=desktop.LOCK_DESKTOP)
+    ap.add_argument('--reason', choices=['manual', 'schedule'], default='manual')
+    ap.add_argument('--start')
+    ap.add_argument('--end')
     args = ap.parse_args()
 
     if args.set_password:
@@ -229,6 +319,33 @@ def main():
 
     if args.uninstall_startup:
         uninstall_startup()
+        return
+
+    # If packaged exe is invoked in lockscreen mode, run lockscreen now
+    if args.mode == 'lockscreen':
+        import lockscreen as _lock
+        # Reuse parsed args for consistency
+        sys.argv = [sys.argv[0], '--desktop-name', args.desktop_name, '--reason', args.reason] + ([] if not args.start or not args.end else ['--start', args.start, '--end', args.end])
+        _lock.main()
+        return
+
+    # Single-instance guard (scheduler/GUI only)
+    _ensure_single_instance()
+
+    # If running as packaged exe, default to GUI manager
+    if getattr(_sys, 'frozen', False) and args.mode == 'scheduler' and not args.lock_now:
+        import ui as _ui
+        _ui.root = _ui.tk.Tk()
+        _ui.app = _ui.AppUI(_ui.root)
+        _ui.root.mainloop()
+        return
+
+    # UI mode if requested (dev mode)
+    if args.ui:
+        import ui as _ui
+        _ui.root = _ui.tk.Tk()  # ensure root defined
+        _ui.app = _ui.AppUI(_ui.root)
+        _ui.root.mainloop()
         return
 
     locker = Locker()

@@ -12,37 +12,7 @@ from tkinter import simpledialog, messagebox
 from screeninfo import get_monitors
 
 import desktop
-
-CONFIG_PATH = Path(__file__).with_name('config.json')
-
-
-def load_config():
-    if not CONFIG_PATH.exists():
-        return {
-            "hotkey": "ctrl+alt+u",
-            "password": {
-                "salt": None,
-                "hash": None,
-                "iterations": 200_000,
-                "algo": "pbkdf2_sha256",
-            },
-        }
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-def verify_password(cfg, password: str) -> bool:
-    from hashlib import pbkdf2_hmac
-    pwcfg = cfg.get("password", {})
-    salt_hex = pwcfg.get("salt")
-    hash_hex = pwcfg.get("hash")
-    iterations = int(pwcfg.get("iterations", 200_000))
-    if not salt_hex or not hash_hex:
-        # No password configured yet -> deny
-        return False
-    salt = bytes.fromhex(salt_hex)
-    calc = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
-    return calc.hex() == hash_hex
+from config import load_config as _load_config, verify_password as _verify
 
 
 class LockScreen:
@@ -70,8 +40,7 @@ class LockScreen:
 
         label = tk.Label(container, text=self.message, fg='white', bg='black', font=('Segoe UI', 24))
         label.pack(pady=12)
-        sub = tk.Label(container, text='Press Ctrl+Alt+U to unlock', fg='#cccccc', bg='black', font=('Segoe UI', 14))
-        sub.pack(pady=8)
+        # No hint text for hotkey
 
         # grab focus
         try:
@@ -109,8 +78,7 @@ class LockScreen:
         if pwd is None:
             return
         try:
-            cfg = load_config()
-            if verify_password(cfg, pwd):
+            if _verify(pwd):
                 self.password_unlocked.set()
             else:
                 messagebox.showerror('Unlock failed', 'Incorrect password.', parent=primary)
@@ -164,6 +132,9 @@ class LockScreen:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--desktop-name', default=desktop.LOCK_DESKTOP)
+    ap.add_argument('--reason', choices=['manual', 'schedule'], default='manual')
+    ap.add_argument('--start')
+    ap.add_argument('--end')
     args = ap.parse_args()
 
     # Attach to lock desktop and make it active
@@ -176,9 +147,16 @@ def main():
         # Keep our handle open while running; will be closed on exit
         pass
 
-    cfg = load_config()
+    cfg = _load_config()
     hotkey = cfg.get('hotkey', 'ctrl+alt+u')
-    LockScreen(hotkey).run()
+    # Build message based on reason
+    if args.reason == 'schedule' and args.start and args.end:
+        msg = f'This desktop is locked by schedule ({args.start}\u2013{args.end}).'
+    elif args.reason == 'manual':
+        msg = 'This desktop is manually locked.'
+    else:
+        msg = 'This desktop is locked.'
+    LockScreen(hotkey, message=msg).run()
 
 
 if __name__ == '__main__':

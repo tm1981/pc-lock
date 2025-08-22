@@ -5,31 +5,14 @@ from pathlib import Path
 from hashlib import pbkdf2_hmac
 from datetime import time as dtime, datetime
 
-CONFIG_PATH = Path(__file__).with_name('config.json')
+from config import load_config, verify_password as _verify_password
 
 
 def _load_config():
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        return load_config()
     except Exception:
         return {}
-
-
-def _verify_password(password: str) -> bool:
-    cfg = _load_config()
-    pwcfg = cfg.get('password', {})
-    salt_hex = pwcfg.get('salt')
-    hash_hex = pwcfg.get('hash')
-    iterations = int(pwcfg.get('iterations', 200_000))
-    if not salt_hex or not hash_hex:
-        return False
-    try:
-        salt = bytes.fromhex(salt_hex)
-    except Exception:
-        return False
-    calc = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
-    return calc.hex() == hash_hex
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -85,7 +68,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json_response(401, {"error": "unauthorized"})
             try:
                 if self.locker and not self.locker.state.active:
-                    self.locker.lock_now()
+                    self.locker.lock_now(reason='manual')
                 return self._json_response(200, {"status": "locked"})
             except Exception as e:
                 return self._json_response(500, {"error": str(e)})
@@ -98,6 +81,22 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json_response(200, {"status": "unlocked"})
             except Exception as e:
                 return self._json_response(500, {"error": str(e)})
+        if self.path == '/api/schedule':
+            if not self._auth_ok():
+                return self._json_response(401, {"error": "unauthorized"})
+            body = self._json if isinstance(self._json, dict) else {}
+            try:
+                enabled = bool(body.get('enabled', False))
+                start = str(body.get('start', '22:00'))
+                end = str(body.get('end', '07:00'))
+                # validate times
+                dtime.fromisoformat(start)
+                dtime.fromisoformat(end)
+                from schedule_store import write_schedule, read_schedule
+                write_schedule(enabled, start, end)
+                return self._json_response(200, {"schedule": read_schedule()})
+            except Exception as e:
+                return self._json_response(400, {"error": f"invalid_schedule: {e}"})
         return self._json_response(404, {"error": "not_found"})
 
     def log_message(self, fmt, *args):
