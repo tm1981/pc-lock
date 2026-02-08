@@ -20,7 +20,7 @@ Notes:
 
 ## Install
 
-1. Install Python 3.10+ on Windows.
+1. Install Python 3.12+ on Windows (minimum 3.10 required).
 2. Create a venv (recommended):
 
 ```powershell
