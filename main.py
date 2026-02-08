@@ -335,17 +335,13 @@ def main():
     # If running as packaged exe, default to GUI manager
     if getattr(_sys, 'frozen', False) and args.mode == 'scheduler' and not args.lock_now:
         import ui as _ui
-        _ui.root = _ui.tk.Tk()
-        _ui.app = _ui.AppUI(_ui.root)
-        _ui.root.mainloop()
+        _ui.main()
         return
 
     # UI mode if requested (dev mode)
     if args.ui:
         import ui as _ui
-        _ui.root = _ui.tk.Tk()  # ensure root defined
-        _ui.app = _ui.AppUI(_ui.root)
-        _ui.root.mainloop()
+        _ui.main()
         return
 
     locker = Locker()

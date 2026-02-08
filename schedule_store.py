@@ -54,7 +54,7 @@ def _dpapi_unprotect(data: bytes) -> bytes:
 def read_schedule() -> dict:
     if not SCHEDULE_PATH.exists():
         # Return defaults
-        return {"enabled": False, "start": "22:00", "end": "07:00"}
+        return {"enabled": False, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1]}
     try:
         enc = SCHEDULE_PATH.read_bytes()
         dec = _dpapi_unprotect(enc)
@@ -63,14 +63,19 @@ def read_schedule() -> dict:
         enabled = bool(obj.get('enabled', False))
         start = str(obj.get('start', '22:00'))
         end = str(obj.get('end', '07:00'))
-        return {"enabled": enabled, "start": start, "end": end}
+        notify_minutes = obj.get('notify_minutes', [5, 1])
+        if not isinstance(notify_minutes, list):
+            notify_minutes = [5, 1]
+        return {"enabled": enabled, "start": start, "end": end, "notify_minutes": notify_minutes}
     except Exception:
         # Corrupt store -> disable schedule
-        return {"enabled": False, "start": "22:00", "end": "07:00"}
+        return {"enabled": False, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1]}
 
 
-def write_schedule(enabled: bool, start: str, end: str) -> None:
-    obj = {"enabled": bool(enabled), "start": str(start), "end": str(end)}
+def write_schedule(enabled: bool, start: str, end: str, notify_minutes: list[int] | None = None) -> None:
+    if notify_minutes is None:
+        notify_minutes = [5, 1]
+    obj = {"enabled": bool(enabled), "start": str(start), "end": str(end), "notify_minutes": notify_minutes}
     raw = json.dumps(obj, separators=(',', ':')).encode('utf-8')
     enc = _dpapi_protect(raw)
     SCHEDULE_PATH.write_bytes(enc)

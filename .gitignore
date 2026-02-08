@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+ui/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PyInstaller
+build/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Application data (user-specific)
+config.json
+config.json.bak
+schedule.dat
+*.log
+
+# Ignore old standalone ui.py if accidentally recreated
+# (now using ui/ package)
