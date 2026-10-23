@@ -29,6 +29,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+   You can also enable "Start with Windows" from the GUI (Security section).
+
 3. First run will generate a default `config.json` with a random password. Change it immediately:
 
 ```powershell
@@ -64,7 +66,8 @@ python main.py
 python main.py --lock-now
 ```
 
-- Unlock during lock screen: press `Ctrl+Alt+U`, enter your password, and press Enter.
+- Unlock during lock screen: press `Ctrl+Alt+U`, type your password in the box that appears, and press Enter (Esc hides it). After 5 wrong attempts input is blocked for 30s (longer each time).
+- Unlocking during a scheduled window skips the rest of that window only; the schedule stays enabled and locks again the next day.
 
 - To exit the scheduler app, press Ctrl+C in the console.
 
@@ -74,22 +77,28 @@ If enabled in `config.json` (`api.enabled: true`), a local REST server starts.
 - Default base URL: http://127.0.0.1:8765
 - Auth: provide the configured unlock password either as JSON `{ "password": "..." }` in the request body, or as `Authorization: Bearer <password>` header.
 
+All responses include CORS headers, so a browser app (e.g. the Next.js web UI) can call the API directly.
+After 5 wrong passwords from one IP within 60s, auth endpoints answer `429` for 60s.
+
 Endpoints:
+- GET /api/status (no auth)
+  - Response: `{ "locked": bool, "reason": "manual"|"schedule"|null, "since": "ISO"|null, "schedule": {...} }`
+
+- GET /api/schedule (no auth)
+  - Response: `{ "schedule": { "enabled", "start", "end", "notify_minutes", "snooze_until", "snoozed" } }`
+
 - POST /api/lock
   - Body: `{ "password": "your_password" }`
-  - Response: `{ "status": "locked" }`
+  - Response: `{ "status": "locked", ...status fields }`
 
 - POST /api/unlock
   - Body: `{ "password": "your_password" }`
-  - Response: `{ "status": "unlocked" }`
+  - Response: `{ "status": "unlocked", ...status fields }`
+  - During a scheduled window this skips the rest of that window (schedule stays enabled).
 
-- GET /api/status
-  - Response: `{ "locked": true | false }`
-
-- POST /api/schedule
-  - Body: `{ "password": "your_password", "enabled": true, "start": "22:00", "end": "07:00" }`
-  - Response: `{ "schedule": { "enabled": true, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1] } }`
-  - Note: `notify_minutes` is read-only via API; configure notification timing through the UI.
+- POST /api/schedule (partial update: omitted fields keep their value; any change clears the skip)
+  - Body: `{ "password": "your_password", "enabled": true, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1] }`
+  - Response: `{ "schedule": { ... } }`
 
 Examples (PowerShell):
 
@@ -139,31 +148,12 @@ Edit `config.json`:
 
 ## Build a standalone .exe
 
-We support packaging using PyInstaller. **Note:** CustomTkinter requires `--onedir` mode (not `--onefile`) because it includes theme/font assets.
+We package with PyInstaller using the checked-in `pclock.spec` (it locates CustomTkinter automatically). CustomTkinter requires `--onedir` mode because it ships theme/font assets.
 
 ```powershell
-pip install pyinstaller
-pip install -r requirements.txt
-
-# Build icon asset
+pip install -r requirements-dev.txt
 python make_icon.py
-
-# Find customtkinter location
-pip show customtkinter
-# Note the Location path, e.g.: c:\users\...\site-packages
-
-# Build (replace <CTK_PATH> with the customtkinter folder path from above)
-pyinstaller --noconfirm --onedir --windowed ^
-  --name pclock ^
-  --icon assets\pclock.ico ^
-  --add-data "assets\pclock.ico;assets" ^
-  --add-data "<CTK_PATH>\customtkinter;customtkinter" ^
-  main.py
-```
-
-Example with typical path:
-```powershell
-pyinstaller --noconfirm --onedir --windowed --name pclock --icon assets\pclock.ico --add-data "assets\pclock.ico;assets" --add-data "C:\Users\tm81\miniconda3\Lib\site-packages\customtkinter;customtkinter" main.py
+pyinstaller --noconfirm pclock.spec
 ```
 
 Run:
@@ -175,6 +165,15 @@ Notes:
 - The tray icon uses assets\\pclock.ico when available; it is embedded via --add-data.
 - If Windows Firewall prompts when enabling API on 0.0.0.0, allow access for your network.
 - **Cannot use `--onefile`** due to CustomTkinter's bundled .json and .otf theme files.
+
+## Tests
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+Tests use a temporary data folder (`PCLOCK_APP_DIR`), so they never touch your real config or lock the screen.
 
 ## Limitations
 - Secure Attention Sequence (Ctrl+Alt+Del), Win+L, and certain OS dialogs are protected by Windows and cannot be blocked by user applications.

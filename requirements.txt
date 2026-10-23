@@ -1,8 +1,7 @@
 screeninfo==0.8.1
 pystray==0.19.5
-pywin32==306
-pycaw==20240210
-comtypes==1.2.0
-pillow==10.4.0
-customtkinter==5.2.2
+pycaw==20260927
+comtypes==1.4.17
+pillow==13.0.0
+customtkinter==6.0.0
 winotify==1.1.0

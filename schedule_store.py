@@ -1,11 +1,17 @@
-import os
 import json
+import threading
 from pathlib import Path
 import ctypes
 from ctypes import wintypes
 
-from config import get_app_dir
-SCHEDULE_PATH = get_app_dir() / 'schedule.dat'
+from config import get_app_dir, atomic_write_bytes
+
+DEFAULT_NOTIFY_MINUTES = [5, 1]
+_lock = threading.RLock()
+
+
+def schedule_path() -> Path:
+    return get_app_dir() / 'schedule.dat'
 
 # DPAPI
 crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
@@ -51,31 +57,52 @@ def _dpapi_unprotect(data: bytes) -> bytes:
         LocalFree(out_blob.pbData)
 
 
+def _defaults() -> dict:
+    return {"enabled": False, "start": "22:00", "end": "07:00",
+            "notify_minutes": list(DEFAULT_NOTIFY_MINUTES), "snooze_until": None}
+
+
 def read_schedule() -> dict:
-    if not SCHEDULE_PATH.exists():
-        # Return defaults
-        return {"enabled": False, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1]}
+    """Return the schedule. `snooze_until` (ISO datetime or None) skips locking until that moment;
+    it is set when someone unlocks during a scheduled window so the schedule stays enabled."""
+    path = schedule_path()
+    if not path.exists():
+        return _defaults()
     try:
-        enc = SCHEDULE_PATH.read_bytes()
-        dec = _dpapi_unprotect(enc)
-        obj = json.loads(dec.decode('utf-8'))
-        # basic validation
-        enabled = bool(obj.get('enabled', False))
-        start = str(obj.get('start', '22:00'))
-        end = str(obj.get('end', '07:00'))
-        notify_minutes = obj.get('notify_minutes', [5, 1])
-        if not isinstance(notify_minutes, list):
-            notify_minutes = [5, 1]
-        return {"enabled": enabled, "start": start, "end": end, "notify_minutes": notify_minutes}
+        with _lock:
+            enc = path.read_bytes()
+        obj = json.loads(_dpapi_unprotect(enc).decode('utf-8'))
+        out = _defaults()
+        out["enabled"] = bool(obj.get('enabled', False))
+        out["start"] = str(obj.get('start', '22:00'))
+        out["end"] = str(obj.get('end', '07:00'))
+        notify = obj.get('notify_minutes', DEFAULT_NOTIFY_MINUTES)
+        if isinstance(notify, list) and all(isinstance(n, int) and n > 0 for n in notify):
+            out["notify_minutes"] = notify
+        snooze = obj.get('snooze_until')
+        out["snooze_until"] = str(snooze) if snooze else None
+        return out
     except Exception:
         # Corrupt store -> disable schedule
-        return {"enabled": False, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1]}
+        return _defaults()
 
 
-def write_schedule(enabled: bool, start: str, end: str, notify_minutes: list[int] | None = None) -> None:
+def write_schedule(enabled: bool, start: str, end: str, notify_minutes: list[int] | None = None,
+                   snooze_until: str | None = None) -> None:
     if notify_minutes is None:
-        notify_minutes = [5, 1]
-    obj = {"enabled": bool(enabled), "start": str(start), "end": str(end), "notify_minutes": notify_minutes}
+        notify_minutes = list(DEFAULT_NOTIFY_MINUTES)
+    obj = {"enabled": bool(enabled), "start": str(start), "end": str(end),
+           "notify_minutes": notify_minutes, "snooze_until": snooze_until}
     raw = json.dumps(obj, separators=(',', ':')).encode('utf-8')
-    enc = _dpapi_protect(raw)
-    SCHEDULE_PATH.write_bytes(enc)
+    with _lock:
+        atomic_write_bytes(schedule_path(), _dpapi_protect(raw))
+
+
+def update_schedule(**changes) -> dict:
+    """Read-modify-write: change only the given fields, keep the rest."""
+    with _lock:
+        sched = read_schedule()
+        sched.update(changes)
+        write_schedule(sched['enabled'], sched['start'], sched['end'],
+                       sched['notify_minutes'], sched['snooze_until'])
+        return sched

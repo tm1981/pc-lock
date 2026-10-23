@@ -1,18 +1,25 @@
 """
 Main application UI for PC-Lock.
 """
-from datetime import datetime, time as dtime
+import queue
+from datetime import datetime
 from tkinter import messagebox
 
 import customtkinter as ctk
 
 import main as core
+import single_instance
 from api import maybe_start_api
-from config import load_config, verify_password, set_password, update_api
+from config import load_config, verify_password, set_password, update_api, has_password
+from scheduler import SchedulerThread, parse_hhmm, fmt_hhmm, is_snoozed
+from schedule_store import read_schedule, update_schedule
 
 from .dialogs import ask_password
-from .scheduler import SchedulerThread, in_lock_window
 from .tray import TrayManager
+
+GREEN = "#22c55e"
+RED = "#ef4444"
+MUTED = ("gray40", "gray60")
 
 
 class AppUI:
@@ -21,12 +28,14 @@ class AppUI:
     def __init__(self, root: ctk.CTk):
         self.root = root
         self.root.title('PC Lock')
-        self.root.geometry('420x680')
-        self.root.minsize(400, 650)
+        self.root.geometry('440x720')
+        self.root.minsize(420, 680)
 
         self.locker = core.Locker()
+        self._actions: queue.Queue = queue.Queue()
         self._loading = False
         self._schedule_dirty = False
+        self.api_server = None
 
         # Configure appearance
         ctk.set_appearance_mode("dark")
@@ -34,29 +43,52 @@ class AppUI:
 
         self._build_ui()
         self.load_into_ui()
-        self.ensure_password_set()
+        if not self.ensure_password_set():
+            self.root.after(0, self.root.destroy)
+            return
 
-        # Start scheduler
-        self.scheduler = SchedulerThread(self.locker, on_state_change=self.update_status)
+        # Start API if enabled (before the scheduler so a port error is shown on an unlocked screen)
+        self._start_api(show_errors=True)
+
+        # Scheduler locks within a second if we're inside the window right now
+        self.scheduler = SchedulerThread(self.locker)
         self.scheduler.start()
-
-        # Check if we should lock immediately
-        self.lock_if_in_schedule_now()
-
-        # Status update timer
-        self.tick()
 
         # System tray
         self.tray = TrayManager(self)
         self.tray.start()
 
-        # Start API if enabled
-        self.api_server = maybe_start_api(self.locker)
-
         self.root.protocol('WM_DELETE_WINDOW', self.minimize_to_tray)
+        self.tick()
+        self._drain_actions()
+
+    # --- cross-thread hand-off ------------------------------------------------------
+    def post(self, fn):
+        """Run fn on the Tk thread. Safe to call from any thread (tray, scheduler, API)."""
+        self._actions.put(fn)
+
+    def _drain_actions(self):
+        try:
+            while True:
+                fn = self._actions.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    print(f'[ui] action failed: {e}')
+        except queue.Empty:
+            pass
+        if single_instance.show_requested():
+            self.show_window()
+        self.root.after(100, self._drain_actions)
+
+    # --- layout ---------------------------------------------------------------------
+    def _section(self, parent, title: str) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="x", pady=(0, 15))
+        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=15, pady=(15, 10))
+        return frame
 
     def _build_ui(self):
-        # Main container with padding
         main = ctk.CTkFrame(self.root, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=20, pady=20)
 
@@ -64,106 +96,52 @@ class AppUI:
         status_frame = ctk.CTkFrame(main)
         status_frame.pack(fill="x", pady=(0, 15))
 
-        self.status_indicator = ctk.CTkLabel(
-            status_frame,
-            text="●",
-            font=ctk.CTkFont(size=24),
-            text_color="#22c55e"  # Green
-        )
+        self.status_indicator = ctk.CTkLabel(status_frame, text="●", font=ctk.CTkFont(size=24), text_color=GREEN)
         self.status_indicator.pack(side="left", padx=15, pady=15)
 
-        self.status_label = ctk.CTkLabel(
-            status_frame,
-            text="Unlocked",
-            font=ctk.CTkFont(size=18, weight="bold")
-        )
+        self.status_label = ctk.CTkLabel(status_frame, text="Unlocked", font=ctk.CTkFont(size=18, weight="bold"))
         self.status_label.pack(side="left", pady=15)
 
-        self.lock_btn = ctk.CTkButton(
-            status_frame,
-            text="Lock Now",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            width=120,
-            height=40,
-            command=self.on_lock_now
-        )
+        self.lock_btn = ctk.CTkButton(status_frame, text="Lock Now", font=ctk.CTkFont(size=14, weight="bold"),
+                                      width=120, height=40, command=self.on_lock_now)
         self.lock_btn.pack(side="right", padx=15, pady=15)
 
         # Schedule section
-        sched_frame = ctk.CTkFrame(main)
-        sched_frame.pack(fill="x", pady=(0, 15))
+        sched_frame = self._section(main, "Schedule")
 
-        ctk.CTkLabel(
-            sched_frame,
-            text="Schedule",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).pack(anchor="w", padx=15, pady=(15, 10))
-
-        # Enable checkbox
         self.enabled_var = ctk.BooleanVar(value=False)
-        self.enabled_cb = ctk.CTkCheckBox(
-            sched_frame,
-            text="Enable scheduled lock",
-            variable=self.enabled_var,
-            font=ctk.CTkFont(size=14),
-            command=self._on_schedule_changed
-        )
-        self.enabled_cb.pack(anchor="w", padx=15, pady=5)
+        ctk.CTkCheckBox(sched_frame, text="Enable scheduled lock", variable=self.enabled_var,
+                        font=ctk.CTkFont(size=14), command=self._on_schedule_changed).pack(anchor="w", padx=15, pady=5)
 
-        # Time inputs row
         time_frame = ctk.CTkFrame(sched_frame, fg_color="transparent")
         time_frame.pack(fill="x", padx=15, pady=10)
 
         ctk.CTkLabel(time_frame, text="Start:", font=ctk.CTkFont(size=14)).pack(side="left")
         self.start_var = ctk.StringVar(value="22:00")
-        self.start_entry = ctk.CTkEntry(
-            time_frame,
-            textvariable=self.start_var,
-            width=80,
-            font=ctk.CTkFont(size=14),
-            justify="center"
-        )
-        self.start_entry.pack(side="left", padx=(5, 20))
-        self.start_entry.bind("<KeyRelease>", lambda e: self._on_schedule_changed())
+        start_entry = ctk.CTkEntry(time_frame, textvariable=self.start_var, width=80,
+                                   font=ctk.CTkFont(size=14), justify="center")
+        start_entry.pack(side="left", padx=(5, 20))
+        start_entry.bind("<KeyRelease>", lambda e: self._on_schedule_changed())
 
         ctk.CTkLabel(time_frame, text="End:", font=ctk.CTkFont(size=14)).pack(side="left")
         self.end_var = ctk.StringVar(value="07:00")
-        self.end_entry = ctk.CTkEntry(
-            time_frame,
-            textvariable=self.end_var,
-            width=80,
-            font=ctk.CTkFont(size=14),
-            justify="center"
-        )
-        self.end_entry.pack(side="left", padx=5)
-        self.end_entry.bind("<KeyRelease>", lambda e: self._on_schedule_changed())
+        end_entry = ctk.CTkEntry(time_frame, textvariable=self.end_var, width=80,
+                                 font=ctk.CTkFont(size=14), justify="center")
+        end_entry.pack(side="left", padx=5)
+        end_entry.bind("<KeyRelease>", lambda e: self._on_schedule_changed())
 
-        # Save schedule button
-        self.save_sched_btn = ctk.CTkButton(
-            sched_frame,
-            text="Save Schedule",
-            font=ctk.CTkFont(size=14),
-            command=self.on_save_schedule
-        )
-        self.save_sched_btn.pack(anchor="e", padx=15, pady=(5, 15))
+        self.sched_info = ctk.CTkLabel(sched_frame, text="", font=ctk.CTkFont(size=12), text_color=MUTED)
+        self.sched_info.pack(anchor="w", padx=15)
+
+        ctk.CTkButton(sched_frame, text="Save Schedule", font=ctk.CTkFont(size=14),
+                      command=self.on_save_schedule).pack(anchor="e", padx=15, pady=(5, 15))
 
         # API section
-        api_frame = ctk.CTkFrame(main)
-        api_frame.pack(fill="x", pady=(0, 15))
-
-        ctk.CTkLabel(
-            api_frame,
-            text="REST API",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).pack(anchor="w", padx=15, pady=(15, 10))
+        api_frame = self._section(main, "REST API")
 
         self.api_enabled_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            api_frame,
-            text="Enable API server",
-            variable=self.api_enabled_var,
-            font=ctk.CTkFont(size=14)
-        ).pack(anchor="w", padx=15, pady=5)
+        ctk.CTkCheckBox(api_frame, text="Enable API server", variable=self.api_enabled_var,
+                        font=ctk.CTkFont(size=14)).pack(anchor="w", padx=15, pady=5)
 
         api_row = ctk.CTkFrame(api_frame, fg_color="transparent")
         api_row.pack(fill="x", padx=15, pady=10)
@@ -178,49 +156,31 @@ class AppUI:
         ctk.CTkEntry(api_row, textvariable=self.api_port_var, width=70,
                      font=ctk.CTkFont(size=14)).pack(side="left", padx=5)
 
-        ctk.CTkButton(
-            api_frame,
-            text="Save API",
-            font=ctk.CTkFont(size=14),
-            command=self.on_save_api
-        ).pack(anchor="e", padx=15, pady=(5, 15))
+        self.api_info = ctk.CTkLabel(api_frame, text="", font=ctk.CTkFont(size=12), text_color=MUTED)
+        self.api_info.pack(anchor="w", padx=15)
 
-        # Password section
-        pw_frame = ctk.CTkFrame(main)
-        pw_frame.pack(fill="x", pady=(0, 15))
+        ctk.CTkButton(api_frame, text="Save API", font=ctk.CTkFont(size=14),
+                      command=self.on_save_api).pack(anchor="e", padx=15, pady=(5, 15))
 
-        ctk.CTkLabel(
-            pw_frame,
-            text="Security",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).pack(anchor="w", padx=15, pady=(15, 10))
+        # Security / startup section
+        pw_frame = self._section(main, "Security")
 
-        ctk.CTkButton(
-            pw_frame,
-            text="Change Password",
-            font=ctk.CTkFont(size=14),
-            fg_color="gray40",
-            hover_color="gray30",
-            command=self.on_change_password
-        ).pack(anchor="e", padx=15, pady=(5, 15))
+        self.startup_var = ctk.BooleanVar(value=core.is_startup_installed())
+        ctk.CTkCheckBox(pw_frame, text="Start with Windows", variable=self.startup_var,
+                        font=ctk.CTkFont(size=14), command=self.on_toggle_startup).pack(anchor="w", padx=15, pady=5)
+
+        ctk.CTkButton(pw_frame, text="Change Password", font=ctk.CTkFont(size=14), fg_color="gray40",
+                      hover_color="gray30", command=self.on_change_password).pack(anchor="e", padx=15, pady=(5, 15))
 
         # Appearance toggle
         appear_frame = ctk.CTkFrame(main, fg_color="transparent")
         appear_frame.pack(fill="x")
 
-        ctk.CTkLabel(
-            appear_frame,
-            text="Theme:",
-            font=ctk.CTkFont(size=12)
-        ).pack(side="left")
+        ctk.CTkLabel(appear_frame, text="Theme:", font=ctk.CTkFont(size=12)).pack(side="left")
 
-        self.appearance_menu = ctk.CTkOptionMenu(
-            appear_frame,
-            values=["Dark", "Light", "System"],
-            command=self._change_appearance,
-            width=100,
-            font=ctk.CTkFont(size=12)
-        )
+        self.appearance_menu = ctk.CTkOptionMenu(appear_frame, values=["Dark", "Light", "System"],
+                                                 command=self._change_appearance, width=100,
+                                                 font=ctk.CTkFont(size=12))
         self.appearance_menu.pack(side="left", padx=10)
         self.appearance_menu.set("Dark")
 
@@ -231,93 +191,147 @@ class AppUI:
         if not self._loading:
             self._schedule_dirty = True
 
-    def update_status(self, locked: bool = None):
-        if locked is None:
-            locked = self.locker.state.active
-
-        if locked:
-            self.status_label.configure(text="Locked")
-            self.status_indicator.configure(text_color="#ef4444")  # Red
+    # --- state -> widgets -----------------------------------------------------------
+    def update_status(self):
+        st = self.locker.state
+        if st.active:
+            text = "Locked (schedule)" if st.reason == 'schedule' else "Locked"
+            self.status_label.configure(text=text)
+            self.status_indicator.configure(text_color=RED)
             self.lock_btn.configure(state="disabled")
         else:
             self.status_label.configure(text="Unlocked")
-            self.status_indicator.configure(text_color="#22c55e")  # Green
+            self.status_indicator.configure(text_color=GREEN)
             self.lock_btn.configure(state="normal")
+
+    def _schedule_info_text(self, sched: dict) -> str:
+        if not sched.get('enabled'):
+            return "Schedule is off"
+        if is_snoozed(datetime.now(), sched):
+            until = datetime.fromisoformat(sched['snooze_until']).strftime('%H:%M')
+            return f"Unlocked for tonight - schedule resumes after {until}"
+        return f"Locks daily {sched['start']}-{sched['end']}"
 
     def load_into_ui(self):
         try:
             self._loading = True
-            from schedule_store import read_schedule
             sched = read_schedule()
             self.enabled_var.set(bool(sched.get('enabled', False)))
             self.start_var.set(sched.get('start', '22:00'))
             self.end_var.set(sched.get('end', '07:00'))
+            self.sched_info.configure(text=self._schedule_info_text(sched))
 
-            cfg = load_config()
-            api = cfg.get('api', {})
+            api = load_config().get('api', {})
             self.api_enabled_var.set(bool(api.get('enabled', False)))
             self.api_host_var.set(str(api.get('host', '127.0.0.1')))
             self.api_port_var.set(str(api.get('port', 8765)))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'[ui] load failed: {e}')
         finally:
             self._loading = False
             self._schedule_dirty = False
 
+    def tick(self):
+        self.update_status()
+        try:
+            sched = read_schedule()
+            self.sched_info.configure(text=self._schedule_info_text(sched))
+            # Reflect changes made elsewhere (API) unless the user is editing the form
+            if not self._schedule_dirty:
+                self._loading = True
+                if self.enabled_var.get() != sched['enabled']:
+                    self.enabled_var.set(sched['enabled'])
+                if self.start_var.get() != sched['start']:
+                    self.start_var.set(sched['start'])
+                if self.end_var.get() != sched['end']:
+                    self.end_var.set(sched['end'])
+        except Exception:
+            pass
+        finally:
+            self._loading = False
+        self.root.after(1000, self.tick)
+
+    # --- actions --------------------------------------------------------------------
+    def _confirm_password(self, prompt: str) -> bool:
+        pw = ask_password(self.root, 'Confirm', prompt)
+        if pw is None:
+            return False
+        if not verify_password(pw):
+            messagebox.showerror('Error', 'Incorrect password.')
+            return False
+        return True
+
     def on_lock_now(self):
         try:
             self.locker.lock_now(reason='manual')
-            self.update_status(True)
+            self.update_status()
         except Exception as e:
             messagebox.showerror('Error', f'Failed to lock: {e}')
 
     def on_save_schedule(self):
         try:
-            pw = ask_password(self.root, 'Confirm', 'Enter password to save schedule:')
-            if pw is None or not verify_password(pw):
-                if pw is not None:
-                    messagebox.showerror('Error', 'Incorrect password.')
-                return
-
-            start = dtime.fromisoformat(self.start_var.get())
-            end = dtime.fromisoformat(self.end_var.get())
-
-            from schedule_store import write_schedule
-            write_schedule(
-                bool(self.enabled_var.get()),
-                start.isoformat(timespec='minutes'),
-                end.isoformat(timespec='minutes')
-            )
-            messagebox.showinfo('Saved', 'Schedule updated.')
-            self._schedule_dirty = False
-            self.lock_if_in_schedule_now()
-        except Exception as e:
+            start = fmt_hhmm(parse_hhmm(self.start_var.get()))
+            end = fmt_hhmm(parse_hhmm(self.end_var.get()))
+            if start == end:
+                raise ValueError('start and end must differ')
+        except ValueError as e:
             messagebox.showerror('Error', f'Invalid schedule: {e}')
+            return
+        if not self._confirm_password('Enter password to save schedule:'):
+            return
+        try:
+            sched = update_schedule(enabled=bool(self.enabled_var.get()), start=start, end=end, snooze_until=None)
+            self._schedule_dirty = False
+            self.load_into_ui()
+            messagebox.showinfo('Saved', self._schedule_info_text(sched))
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to save schedule: {e}')
+
+    def _start_api(self, show_errors: bool):
+        try:
+            self.api_server = maybe_start_api(self.locker)
+        except OSError as e:
+            self.api_server = None
+            self.api_info.configure(text=f"Could not start: {e.strerror or e}", text_color=RED)
+            if show_errors:
+                messagebox.showerror('API', f'Could not start the API server: {e}')
+            return
+        if self.api_server:
+            self.api_info.configure(text=f"Running on http://{self.api_server.host}:{self.api_server.port}",
+                                    text_color=MUTED)
+        else:
+            self.api_info.configure(text="Stopped", text_color=MUTED)
 
     def on_save_api(self):
         try:
-            pw = ask_password(self.root, 'Confirm', 'Enter password to save API settings:')
-            if pw is None or not verify_password(pw):
-                if pw is not None:
-                    messagebox.showerror('Error', 'Incorrect password.')
-                return
-
             enabled = bool(self.api_enabled_var.get())
             host = self.api_host_var.get().strip() or '127.0.0.1'
             port = int(self.api_port_var.get().strip() or '8765')
-            update_api(enabled, host, port)
-
-            if self.api_server:
-                try:
-                    self.api_server.stop()
-                except Exception:
-                    pass
-                self.api_server = None
-
-            self.api_server = maybe_start_api(self.locker)
-            messagebox.showinfo('Saved', 'API settings updated.')
-        except Exception as e:
+            if not 1 <= port <= 65535:
+                raise ValueError('port must be between 1 and 65535')
+        except ValueError as e:
             messagebox.showerror('Error', f'Invalid API settings: {e}')
+            return
+        if not self._confirm_password('Enter password to save API settings:'):
+            return
+        update_api(enabled, host, port)
+        if self.api_server:
+            try:
+                self.api_server.stop()
+            except Exception:
+                pass
+            self.api_server = None
+        self._start_api(show_errors=True)
+        if self.api_server or not enabled:
+            messagebox.showinfo('Saved', 'API settings updated.')
+
+    def on_toggle_startup(self):
+        want = bool(self.startup_var.get())
+        try:
+            core.install_startup() if want else core.uninstall_startup()
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to update startup setting: {e}')
+        self.startup_var.set(core.is_startup_installed())
 
     def on_change_password(self):
         old_pw = ask_password(self.root, 'Change Password', 'Enter current password:')
@@ -326,104 +340,65 @@ class AppUI:
         if not verify_password(old_pw):
             messagebox.showerror('Error', 'Current password is incorrect.')
             return
-
-        new_pw = ask_password(self.root, 'Change Password', 'Enter new password:')
-        if new_pw is None or len(new_pw) < 4:
-            messagebox.showerror('Error', 'Password must be at least 4 characters.')
+        new_pw = self._ask_new_password('Change Password')
+        if new_pw is None:
             return
-
-        confirm = ask_password(self.root, 'Change Password', 'Confirm new password:')
-        if confirm != new_pw:
-            messagebox.showerror('Error', 'Passwords do not match.')
-            return
-
         try:
             set_password(new_pw)
             messagebox.showinfo('Success', 'Password changed.')
         except Exception as e:
             messagebox.showerror('Error', f'Failed to change password: {e}')
 
-    def ensure_password_set(self):
-        try:
-            cfg = load_config()
-            pwcfg = cfg.get('password', {})
-            if not pwcfg.get('salt') or not pwcfg.get('hash'):
-                while True:
-                    new_pw = ask_password(self.root, 'Set Password', 'Create a new unlock password:')
-                    if new_pw is None:
-                        messagebox.showerror('Required', 'A password is required on first run.')
-                        continue
-                    if len(new_pw) < 4:
-                        messagebox.showerror('Error', 'Password must be at least 4 characters.')
-                        continue
+    def _ask_new_password(self, title: str) -> str | None:
+        while True:
+            new_pw = ask_password(self.root, title, 'Enter new password:')
+            if new_pw is None:
+                return None
+            if len(new_pw) < 4:
+                messagebox.showerror('Error', 'Password must be at least 4 characters.')
+                continue
+            if ask_password(self.root, title, 'Confirm new password:') != new_pw:
+                messagebox.showerror('Error', 'Passwords do not match.')
+                continue
+            return new_pw
 
-                    confirm = ask_password(self.root, 'Set Password', 'Confirm password:')
-                    if confirm != new_pw:
-                        messagebox.showerror('Error', 'Passwords do not match.')
-                        continue
+    def ensure_password_set(self) -> bool:
+        """First run: require a password. Returns False if the user cancels (app exits)."""
+        if has_password():
+            return True
+        new_pw = self._ask_new_password('Set Password')
+        if new_pw is None:
+            messagebox.showerror('Required', 'A password is required. PC Lock will exit.')
+            return False
+        set_password(new_pw)
+        messagebox.showinfo('Success', 'Password set.')
+        return True
 
-                    set_password(new_pw)
-                    messagebox.showinfo('Success', 'Password set.')
-                    break
-        except Exception:
-            pass
-
-    def lock_if_in_schedule_now(self):
-        try:
-            from schedule_store import read_schedule
-            sched = read_schedule()
-            if not bool(sched.get('enabled', False)):
-                return
-            start = dtime.fromisoformat(sched.get('start', '22:00'))
-            end = dtime.fromisoformat(sched.get('end', '07:00'))
-            if in_lock_window(datetime.now(), start, end):
-                self.locker.lock_now(
-                    reason='schedule',
-                    start=start.isoformat(timespec='minutes'),
-                    end=end.isoformat(timespec='minutes')
-                )
-                self.update_status(True)
-        except Exception:
-            pass
-
-    def tick(self):
-        self.update_status()
-
-        if not self._schedule_dirty:
+    def request_exit(self):
+        self.show_window()
+        if not self._confirm_password('Enter password to exit:'):
+            return
+        self.scheduler.stop()
+        self.tray.stop()
+        if self.api_server:
             try:
-                self._loading = True
-                from schedule_store import read_schedule
-                sched = read_schedule()
-                enabled = bool(sched.get('enabled', False))
-                if self.enabled_var.get() != enabled:
-                    self.enabled_var.set(enabled)
+                self.api_server.stop()
             except Exception:
                 pass
-            finally:
-                self._loading = False
-
-        self.root.after(1000, self.tick)
+        self.root.destroy()
 
     def minimize_to_tray(self):
-        try:
-            self.root.withdraw()
-            self.tray.show()
-        except Exception:
-            pass
+        self.root.withdraw()
 
     def show_window(self):
-        try:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
-            self.tray.hide()
-        except Exception:
-            pass
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
 
 def main():
     root = ctk.CTk()
-    app = AppUI(root)
+    AppUI(root)
     root.mainloop()
 
 

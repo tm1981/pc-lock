@@ -8,15 +8,17 @@
 ## Dependencies
 
 ```
-screeninfo==0.8.1     # Multi-monitor detection
-pystray==0.19.5       # System tray icon
-pywin32==306          # Win32 API (registry)
-pycaw==20240210       # Audio muting via COM
-comtypes==1.2.0       # COM interface for pycaw
-pillow==10.4.0        # Tray icon rendering
-customtkinter==5.2.2  # Modern dark theme UI widgets
-winotify==1.1.0       # Windows toast notifications
+screeninfo==0.8.1       # Multi-monitor detection
+pystray==0.19.5         # System tray icon
+pycaw==20260927         # Audio muting (new AudioDevice.EndpointVolume API; old API still handled)
+comtypes==1.4.17        # COM for pycaw
+pillow==13.0.0          # Tray icon rendering
+customtkinter==6.0.0    # UI widgets
+winotify==1.1.0         # Toast notifications
 ```
+
+Dev: `requirements-dev.txt` (pytest, pyinstaller). Tested on Python 3.14 (miniconda).
+The python.org 3.10 install on this machine has no tkinter. pywin32 was removed (unused).
 
 ## Standard Library Usage
 
@@ -42,19 +44,14 @@ winotify==1.1.0       # Windows toast notifications
 
 ## Build Tool
 
-**PyInstaller** for single-exe packaging:
+**PyInstaller** with the tracked `pclock.spec` (onedir; locates CustomTkinter itself):
 
 ```powershell
-pip install pyinstaller
-python make_icon.py              # Generate assets/pclock.ico
-pyinstaller --noconfirm --onefile --windowed \
-  --name pclock \
-  --icon assets\pclock.ico \
-  --add-data assets\pclock.ico;assets \
-  main.py
+python make_icon.py
+pyinstaller --noconfirm pclock.spec
 ```
 
-**Output**: `dist/pclock.exe`
+**Output**: `dist/pclock/pclock.exe` (build/ and dist/ are not tracked in git)
 
 ## Assets
 

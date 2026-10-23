@@ -3,63 +3,51 @@
 ## Lock Flow
 
 ```
-Locker.lock_now(reason, start, end)
-    │
-    ├─► Mute audio via pycaw
-    │
-    ├─► Create/open alternate desktop
-    │   └─► desktop.create_or_open_desktop('LockDesktop')
-    │
-    ├─► Spawn subprocess
-    │   ├─► [frozen] pclock.exe --mode lockscreen --desktop-name LockDesktop
-    │   └─► [dev] python lockscreen.py --desktop-name LockDesktop
-    │
-    ├─► Update LockState(active=True)
-    │
-    └─► Start watcher thread
-        └─► Monitors process exit, resets state
+Locker.lock_now(reason, start, end)          (thread-safe: RLock)
+    |- Mute audio via pycaw (COM initialised per call; old + new pycaw API)
+    |- Open LockDesktop once, handle kept for app lifetime
+    |- Spawn lockscreen child ([frozen] pclock.exe --mode lockscreen | [dev] python lockscreen.py)
+    |- LockState(active=True, reason, since)
+    `- Watcher thread waits for child exit
 ```
 
-## Unlock Flow
+## Unlock Paths
 
 ```
-User presses Ctrl+Alt+U on lock screen
-    │
-    ├─► simpledialog password prompt
-    │
-    ├─► config.verify_password() validates
-    │
-    ├─► desktop.switch_desktop(Default)
-    │
-    ├─► Destroy all windows
-    │
-    └─► os._exit(0)
-        │
-        └─► Parent watcher thread detects exit
-            ├─► If reason was 'schedule': disable schedule
-            └─► Reset LockState()
+A) Password on lock screen (Ctrl+Alt+U -> inline entry -> Enter)
+     lockscreen switches to Default, os._exit(0)
+     watcher sees exit code 0 -> switch Default, restore audio, clear state,
+     if reason == 'schedule': snooze_current_window()  (schedule stays ENABLED)
+
+B) unlock_now()  (API / scheduler at window end / Ctrl+C)
+     clears state FIRST (watcher then ignores the exit), switch Default,
+     terminate child, restore audio, snooze if reason == 'schedule' and snooze=True
+
+C) Lock screen crashes / Alt+F4 / mainloop ends -> exit code != 0
+     watcher respawns lock screen (max 3 per lock), then gives up and
+     switches back to Default so the user is never stuck on an empty desktop
 ```
 
-## Schedule Check (1s interval)
+## Schedule Check (scheduler.SchedulerThread, 1s, used by GUI AND console)
 
 ```
-scheduler_loop() or SchedulerThread.run()
-    │
-    ├─► schedule_store.read_schedule()
-    │   └─► DPAPI decrypt schedule.dat
-    │
-    ├─► Parse start/end times (HH:MM)
-    │
-    ├─► in_lock_window(now, start, end)
-    │   ├─► If start < end: direct range check
-    │   └─► If start > end: overnight (spans midnight)
-    │
-    ├─► If should_lock AND not active:
-    │   └─► locker.lock_now(reason='schedule')
-    │
-    └─► If not should_lock AND active:
-        └─► locker.unlock_now()
+tick(now)
+    |- read_schedule()  (DPAPI)
+    |- should_lock = enabled AND in_lock_window AND not snoozed
+    |- should_lock and not active -> lock_now('schedule')
+    |- not should_lock and active and reason == 'schedule' -> unlock_now(snooze=False)
+    |     (manual locks are never ended by the schedule)
+    `- outside window -> warning toasts once per threshold, text shows real minutes left
 ```
+
+`snooze_until` (ISO datetime in schedule.dat) = end of the window the user unlocked.
+It expires by itself; any schedule save (UI or API) clears it.
+
+## Threading Rule (UI)
+
+Tk is only touched on the Tk thread. Tray callbacks and other threads call
+`AppUI.post(fn)`; a 100ms `_drain_actions` loop runs them. The same loop polls the
+single-instance "show window" event (`single_instance.py`).
 
 ## Configuration Flow
 

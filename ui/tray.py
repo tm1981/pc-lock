@@ -9,10 +9,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import pystray
 
-from .dialogs import ask_password
-from config import verify_password
-from tkinter import messagebox
-
 
 class TrayManager:
     """System tray icon manager."""
@@ -61,23 +57,19 @@ class TrayManager:
     def hide(self):
         self.icon.visible = False
 
+    def stop(self):
+        try:
+            self.icon.visible = False
+            self.icon.stop()
+        except Exception:
+            pass
+
+    # Menu callbacks run on the pystray thread: never touch Tk here, hand off to the UI thread
     def on_open(self, icon, item):
-        self.app.show_window()
+        self.app.post(self.app.show_window)
 
     def on_lock(self, icon, item):
-        self.app.root.after(0, self.app.on_lock_now)
+        self.app.post(self.app.on_lock_now)
 
     def on_exit(self, icon, item):
-        def prompt_and_exit():
-            pw = ask_password(self.app.root, 'Exit PC Lock', 'Enter password to exit:')
-            if pw and verify_password(pw):
-                try:
-                    self.app.scheduler.stop()
-                except Exception:
-                    pass
-                self.icon.visible = False
-                self.icon.stop()
-                self.app.root.destroy()
-            elif pw is not None:
-                messagebox.showerror('Error', 'Incorrect password.')
-        self.app.root.after(0, prompt_and_exit)
+        self.app.post(self.app.request_exit)

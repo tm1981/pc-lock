@@ -1,23 +1,24 @@
 # Components Reference
 
-## main.py (379 lines)
-**Entry point and core orchestrator**
+## main.py
+**Entry point, Locker, startup registry, single-instance guard**
 
-### Classes
-| Class | Description |
-|-------|-------------|
-| `Locker` | Lock state management, process spawning, audio control |
-| `LockState` | Dataclass: process, active, reason, start, end |
+| Item | Description |
+|------|-------------|
+| `Locker` | Thread-safe lock state, child spawn/respawn, audio mute/restore, `status()` |
+| `LockState` | Dataclass: process, active, reason, start, end, since |
+| `install_startup()` / `uninstall_startup()` / `is_startup_installed()` | HKCU Run (frozen exe, or pythonw + `--ui`) |
+| `_ensure_single_instance()` | Global mutex; a second launch signals `single_instance` and exits |
 
-### Key Functions
-| Function | Description |
-|----------|-------------|
-| `scheduler_loop(locker)` | Infinite loop checking schedule every 1s |
-| `lock_if_in_schedule_now(locker)` | Immediate schedule check on startup |
-| `in_lock_window(now, start, end)` | Time comparison with overnight support |
-| `_ensure_single_instance()` | Global mutex singleton enforcement |
-| `install_startup()` / `uninstall_startup()` | HKCU Run registry ops |
-| `set_password_interactive()` | CLI password setup |
+## scheduler.py
+**Pure schedule logic + `SchedulerThread` (shared by GUI and console)**
+
+`parse_hhmm`, `fmt_hhmm`, `in_lock_window`, `window_end`, `next_window_start`,
+`is_snoozed`, `should_lock`, `snooze_current_window`, `SchedulerThread.tick(now)`.
+`ui/scheduler.py` only re-exports it.
+
+## single_instance.py
+Named auto-reset event `Local\PC_LOCK_SHOW_WINDOW`: `signal_show()`, `show_requested()`.
 
 ---
 
@@ -30,14 +31,14 @@
 | `ui/__init__.py` | ~12 | Package exports for backward compatibility |
 | `ui/app.py` | ~430 | Main AppUI class, window setup, event handlers |
 | `ui/dialogs.py` | ~52 | PasswordDialog class and ask_password helper |
-| `ui/scheduler.py` | ~98 | SchedulerThread with notification timing |
+| `ui/scheduler.py` | ~8 | Re-export of top-level scheduler |
 | `ui/tray.py` | ~80 | TrayManager for pystray system tray |
 
 ### Key Classes
 | Class | Module | Description |
 |-------|--------|-------------|
 | `AppUI` | app.py | Main window (420x680), dark theme, all config panels |
-| `SchedulerThread` | scheduler.py | Background scheduler with notification support |
+| `SchedulerThread` | ../scheduler.py | Re-exported shared scheduler |
 | `TrayManager` | tray.py | pystray integration for system tray |
 | `PasswordDialog` | dialogs.py | Modern CTkToplevel password input |
 
@@ -45,14 +46,15 @@
 - **Status frame**: Colored indicator (🟢/🔴), Lock Now button
 - **Schedule frame**: Enable checkbox, start/end time entries, Save button
 - **API frame**: Enable checkbox, host/port inputs, Save button
-- **Security frame**: Change password button
+- **Security frame**: Start with Windows checkbox, Change password button
 - **Theme selector**: Dark/Light/System dropdown
 
 ### Features
 - **Dark theme by default** with system theme support
 - **Rounded widgets** via CustomTkinter
 - **Notification integration** - shows warnings before lock
-- **Tray minimize** - password-protected exit
+- **Tray** - icon always visible; password-protected exit
+- **Status lines** - schedule state (off / daily / skipped tonight) and API running/error
 
 ---
 
@@ -70,21 +72,14 @@
 
 ---
 
-## lockscreen.py (164 lines)
-**Lock screen display on alternate desktop**
+## lockscreen.py
+**Lock screen on the alternate desktop**
 
-### Classes
-| Class | Description |
-|-------|-------------|
-| `LockScreen` | Fullscreen windows, hotkey binding, password prompt |
-
-### Key Methods
-| Method | Description |
-|--------|-------------|
-| `_build_window_for_monitor(m)` | Creates Tk/Toplevel per monitor |
-| `_bind_hotkeys()` | Ctrl+Alt+U triggers unlock |
-| `_on_hotkey()` | Password dialog, switches back on success |
-| `run()` | Main loop with unlock polling |
+- Per-monitor fullscreen windows (DPI aware), clock + message
+- Hotkey from config (`hotkey_to_tk`), default Ctrl+Alt+U, shows an inline password entry
+- 5 wrong attempts -> input disabled 30s x n; panel hides after 30s idle
+- Alt+F4 / close ignored; exit code 0 only on correct password, otherwise 3
+- Fails closed: with no readable password hash nothing unlocks (Ctrl+Alt+Del -> sign out is the escape)
 
 ---
 
@@ -117,43 +112,35 @@
 
 ---
 
-## schedule_store.py (82 lines)
-**DPAPI-encrypted schedule storage**
+## schedule_store.py
+**DPAPI-encrypted schedule storage** (`%LOCALAPPDATA%/PC-Lock/schedule.dat`, atomic writes)
 
 | Function | Description |
 |----------|-------------|
-| `read_schedule()` | Decrypt and return schedule dict |
-| `write_schedule(enabled, start, end, notify_minutes)` | Encrypt and save |
-| `_dpapi_protect(data)` | CryptProtectData wrapper |
-| `_dpapi_unprotect(data)` | CryptUnprotectData wrapper |
+| `read_schedule()` | Decrypt; corrupt -> defaults (disabled) |
+| `write_schedule(enabled, start, end, notify_minutes, snooze_until)` | Encrypt and save |
+| `update_schedule(**changes)` | Read-modify-write, keeps other fields |
 
-**Schedule structure**:
 ```json
-{
-  "enabled": true,
-  "start": "22:00",
-  "end": "07:00",
-  "notify_minutes": [5, 1]
-}
+{"enabled": true, "start": "22:00", "end": "07:00", "notify_minutes": [5, 1], "snooze_until": null}
 ```
-
-**Storage**: `%LOCALAPPDATA%/PC-Lock/schedule.dat`
 
 ---
 
-## api.py (139 lines)
-**REST API server**
+## api.py
+**REST API** (ThreadingHTTPServer; CORS headers on every response; per-IP auth throttle 5 fails/60s -> 429)
 
-### Endpoints
 | Endpoint | Method | Auth | Response |
 |----------|--------|------|----------|
-| `/api/status` | GET | No | `{"locked": bool}` |
-| `/api/lock` | POST | Yes | `{"status": "locked"}` |
-| `/api/unlock` | POST | Yes | `{"status": "unlocked"}` |
-| `/api/schedule` | POST | Yes | `{"schedule": {...}}` |
+| `/api/status` | GET | No | `{locked, reason, since, schedule}` |
+| `/api/schedule` | GET | No | `{schedule}` |
+| `/api/lock` | POST | Yes | `{status: "locked", ...}` |
+| `/api/unlock` | POST | Yes | `{status: "unlocked", ...}` (snoozes the scheduled window) |
+| `/api/schedule` | POST | Yes | partial update; clears snooze |
 
-### Classes
-| Class | Description |
-|-------|-------------|
-| `ApiServer` | ThreadingHTTPServer wrapper |
-| `_Handler` | Request handler with auth |
+`ApiServer.stop()` also calls `server_close()` so the port can be re-bound.
+`maybe_start_api()` raises `OSError` if the port is taken (callers show/print it).
+
+## config.py
+`PCLOCK_APP_DIR` env var overrides the data folder (tests use it). Atomic writes,
+`hmac.compare_digest`, `has_password()`.

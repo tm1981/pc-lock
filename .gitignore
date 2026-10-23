@@ -9,7 +9,7 @@ ui/__pycache__/
 *.egg
 .eggs/
 *.manifest
-*.spec
+# pclock.spec is tracked on purpose
 
 # Virtual environments
 .venv/
@@ -38,3 +38,6 @@ schedule.dat
 
 # Ignore old standalone ui.py if accidentally recreated
 # (now using ui/ package)
+
+# Tests
+.pytest_cache/

@@ -26,6 +26,7 @@ Schedule data is encrypted using **Windows DPAPI** (Data Protection API):
 - Stored in `schedule.dat` (binary blob)
 - Only readable by the same Windows user
 - Prevents schedule tampering via file editing
+- Writes are atomic (temp file + rename)
 
 ## Desktop Isolation
 
@@ -61,7 +62,8 @@ WinSta0 (Window Station)
 | **Binding** | localhost (`127.0.0.1`) by default |
 | **Auth** | Same password as unlock |
 | **Methods** | Bearer token OR JSON body |
-| **CORS** | Enabled for localhost convenience |
+| **CORS** | `*` on every response (browser web UI can call it) |
+| **Throttle** | 5 failed auths per IP in 60s → 429 for 60s |
 
 **Warning**: Do not expose API on `0.0.0.0` without understanding risks.
 

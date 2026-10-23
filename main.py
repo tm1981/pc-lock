@@ -1,60 +1,54 @@
 import argparse
-import json
-import os
-import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime
 from pathlib import Path
-from secrets import token_bytes
-from hashlib import pbkdf2_hmac
 
 import desktop
-import sys as _sys
+from scheduler import SchedulerThread, in_lock_window, snooze_current_window  # noqa: F401 (re-export)
 
-CONFIG_PATH = Path(__file__).with_name('config.json')
-
-
-def load_config():
-    from config import load_config as _load
-    return _load()
+STARTUP_VALUE_NAME = 'PC-Lock'
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
-def save_config(cfg):
-    from config import save_config as _save
-    return _save(cfg)
+def _startup_command() -> str:
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    # Prefer pythonw so no console window appears at logon
+    exe = Path(sys.executable)
+    pythonw = exe.with_name('pythonw.exe')
+    exe = pythonw if pythonw.exists() else exe
+    return f'"{exe}" "{Path(__file__).resolve()}" --ui'
+
+
+def is_startup_installed() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+            return True
+    except OSError:
+        return False
 
 
 def install_startup():
     """Add app to HKCU Run so it starts at user logon."""
-    try:
-        import winreg
-        run_key_path = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key_path, 0, winreg.KEY_SET_VALUE) as key:
-            exe = sys.executable
-            script = str(Path(__file__).resolve())
-            cmd = f'"{exe}" "{script}"'
-            winreg.SetValueEx(key, 'PC-Lock', 0, winreg.REG_SZ, cmd)
-        print('Installed startup entry in HKCU Run.')
-    except Exception as e:
-        print(f'Failed to install startup entry: {e}')
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
 
 
 def uninstall_startup():
     """Remove app from HKCU Run."""
-    try:
-        import winreg
-        run_key_path = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key_path, 0, winreg.KEY_SET_VALUE) as key:
-            try:
-                winreg.DeleteValue(key, 'PC-Lock')
-                print('Removed startup entry from HKCU Run.')
-            except FileNotFoundError:
-                print('Startup entry not present.')
-    except Exception as e:
-        print(f'Failed to remove startup entry: {e}')
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        try:
+            winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+        except FileNotFoundError:
+            pass
 
 
 def set_password_interactive():
@@ -74,14 +68,39 @@ def set_password_interactive():
         print('Password updated.')
         return
 
-def in_lock_window(now: datetime, start: dtime, end: dtime) -> bool:
-    cur = now.time()
-    if start == end:
-        return False
-    if start < end:
-        return start <= cur < end
-    # overnight
-    return cur >= start or cur < end
+
+def _endpoint_volume():
+    """Speaker IAudioEndpointVolume; supports both old and new pycaw APIs."""
+    from pycaw.pycaw import AudioUtilities
+    speakers = AudioUtilities.GetSpeakers()
+    if hasattr(speakers, 'EndpointVolume'):  # pycaw >= 2025
+        return speakers.EndpointVolume
+    from ctypes import POINTER, cast
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import IAudioEndpointVolume
+    interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    return cast(interface, POINTER(IAudioEndpointVolume))
+
+
+def _with_com(fn):
+    """Run fn with COM initialised: lock/unlock is called from scheduler, API and UI threads."""
+    import comtypes
+    comtypes.CoInitialize()
+    try:
+        return fn()
+    finally:
+        comtypes.CoUninitialize()
+
+
+def _switch_to_default_desktop():
+    try:
+        hdef = desktop.open_desktop(desktop.DEFAULT_DESKTOP)
+        try:
+            desktop.switch_desktop(hdef)
+        finally:
+            desktop.close_desktop(hdef)
+    except Exception as e:
+        print(f'[locker] switch to default desktop failed: {e}')
 
 
 @dataclass
@@ -91,203 +110,149 @@ class LockState:
     reason: str | None = None
     start: str | None = None
     end: str | None = None
+    since: datetime | None = None
 
 
 class Locker:
+    MAX_RESPAWNS = 3  # lock screen crashes tolerated per lock before giving up
+
     def __init__(self):
         self.state = LockState()
-        self._watch_thread = None
-        self.override_until: datetime | None = None
+        self._mutex = threading.RLock()
+        self._hdesk = None  # kept open for the app lifetime so the lock desktop persists
         self._prev_muted: int | None = None
 
-    def _watch_child(self, proc: subprocess.Popen):
-        try:
-            proc.wait()
-        except Exception:
-            pass
-        # If the same process is still referenced, mark as inactive
-        if self.state.process is proc:
-            # If current lock was schedule-initiated, disable schedule on manual unlock
-            try:
-                if self.state.reason == 'schedule':
-                    from schedule_store import read_schedule, write_schedule
-                    sched = read_schedule()
-                    if bool(sched.get('enabled', False)):
-                        write_schedule(False, sched.get('start', '22:00'), sched.get('end', '07:00'))
-            except Exception:
-                pass
-            # Clear state
-            self.state = LockState()
-
+    # --- audio -----------------------------------------------------------------
     def _mute_system(self):
-        try:
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            from ctypes import POINTER, cast
-            from comtypes import CLSCTX_ALL
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
-            current = int(volume.GetMute())
+        def mute():
+            volume = _endpoint_volume()
             if self._prev_muted is None:
-                self._prev_muted = current
-            if current == 0:
-                volume.SetMute(1, None)
-        except Exception:
-            pass
+                self._prev_muted = int(volume.GetMute())
+            volume.SetMute(1, None)
+        try:
+            _with_com(mute)
+        except Exception as e:
+            print(f'[locker] mute failed: {e}')
 
     def _restore_audio(self):
+        if self._prev_muted is None:
+            return
+        prev, self._prev_muted = self._prev_muted, None
         try:
-            if self._prev_muted is None:
-                return
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            from ctypes import POINTER, cast
-            from comtypes import CLSCTX_ALL
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
-            volume.SetMute(int(self._prev_muted), None)
-        except Exception:
-            pass
-        finally:
-            self._prev_muted = None
+            _with_com(lambda: _endpoint_volume().SetMute(prev, None))
+        except Exception as e:
+            print(f'[locker] restore audio failed: {e}')
+
+    # --- lock screen process -----------------------------------------------------
+    def _spawn(self, reason: str, start: str | None, end: str | None) -> subprocess.Popen:
+        if self._hdesk is None:
+            self._hdesk = desktop.create_or_open_desktop(desktop.LOCK_DESKTOP)
+        if getattr(sys, 'frozen', False):
+            # Relaunch the same EXE in lockscreen mode
+            cmd = [sys.executable, '--mode', 'lockscreen']
+        else:
+            cmd = [sys.executable, str(Path(__file__).with_name('lockscreen.py'))]
+        cmd += ['--desktop-name', desktop.LOCK_DESKTOP, '--reason', reason]
+        if reason == 'schedule' and start and end:
+            cmd += ['--start', start, '--end', end]
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        return subprocess.Popen(cmd, creationflags=flags)
+
+    def _watch_child(self, proc: subprocess.Popen, respawns: int):
+        code = proc.wait()
+        with self._mutex:
+            if self.state.process is not proc:
+                return  # we ended this lock ourselves (unlock_now)
+            if code != 0 and respawns < self.MAX_RESPAWNS:
+                # Lock screen crashed: bring it back instead of leaving the PC unlocked
+                print(f'[locker] lock screen exited with {code}; restarting')
+                try:
+                    new = self._spawn(self.state.reason, self.state.start, self.state.end)
+                    self.state.process = new
+                    threading.Thread(target=self._watch_child, args=(new, respawns + 1), daemon=True).start()
+                    return
+                except Exception as e:
+                    print(f'[locker] respawn failed: {e}')
+            # Unlocked with the password on the lock screen (exit code 0), or gave up respawning
+            reason = self.state.reason
+            self.state = LockState()
+        _switch_to_default_desktop()  # never leave the user on an empty lock desktop
+        self._restore_audio()
+        if reason == 'schedule':
+            # Keep the schedule enabled but don't re-lock for the rest of this window
+            try:
+                snooze_current_window()
+            except Exception as e:
+                print(f'[locker] snooze failed: {e}')
 
     def lock_now(self, reason: str = 'manual', start: str | None = None, end: str | None = None):
-        if self.state.active:
-            return
-        # Mute audio (A1)
-        self._mute_system()
-        # Create/open alternate desktop and spawn lockscreen process bound to it
-        hdesk = desktop.create_or_open_desktop(desktop.LOCK_DESKTOP)
-        # Keep the handle open in this process lifetime
-        # Start child process
-        if getattr(_sys, 'frozen', False):
-            # Relaunch the same EXE in lockscreen mode
-            cmd = [sys.executable, '--mode', 'lockscreen', '--desktop-name', desktop.LOCK_DESKTOP, '--reason', reason]
-            if reason == 'schedule' and start and end:
-                cmd += ['--start', start, '--end', end]
-        else:
-            cmd = [sys.executable, str(Path(__file__).with_name('lockscreen.py')), '--desktop-name', desktop.LOCK_DESKTOP, '--reason', reason]
-            if reason == 'schedule' and start and end:
-                cmd += ['--start', start, '--end', end]
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP
-        # Hide any console window for child on Windows
-        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
-            flags |= subprocess.CREATE_NO_WINDOW
-        proc = subprocess.Popen(cmd, creationflags=flags)
-        self.state = LockState(process=proc, active=True, reason=reason, start=start, end=end)
-        # Start watcher to reset state when child exits (e.g., after password unlock)
-        try:
-            import threading
-            self._watch_thread = threading.Thread(target=self._watch_child, args=(proc,), daemon=True)
-            self._watch_thread.start()
-        except Exception:
-            pass
-        # Do not close hdesk yet; keeping handle open ensures desktop persists
-        # We intentionally leak hdesk here; the OS will clean up on exit.
+        with self._mutex:
+            if self.state.active:
+                return
+            self._mute_system()
+            try:
+                proc = self._spawn(reason, start, end)
+            except Exception:
+                self._restore_audio()
+                raise
+            self.state = LockState(process=proc, active=True, reason=reason, start=start, end=end,
+                                   since=datetime.now())
+            threading.Thread(target=self._watch_child, args=(proc, 0), daemon=True).start()
 
-    def unlock_now(self):
-        if not self.state.active:
-            return
-        # Switch back to default desktop (best-effort)
-        try:
-            hdef = desktop.open_desktop(desktop.DEFAULT_DESKTOP)
-            desktop.switch_desktop(hdef)
-            desktop.close_desktop(hdef)
-        except Exception:
-            pass
-        # Terminate child process if still alive
-        if self.state.process and self.state.process.poll() is None:
+    def unlock_now(self, snooze: bool = True):
+        """End the lock. With snooze=True an unlock inside the scheduled window skips the rest of it,
+        otherwise the scheduler would re-lock a second later."""
+        with self._mutex:
+            if not self.state.active:
+                return
+            proc, reason = self.state.process, self.state.reason
+            # Clear state first so the watcher thread knows this exit was intentional
+            self.state = LockState()
+        _switch_to_default_desktop()
+        if proc and proc.poll() is None:
             try:
-                self.state.process.send_signal(signal.CTRL_BREAK_EVENT)
-                # Give it a moment to exit
-                for _ in range(20):
-                    if self.state.process.poll() is not None:
-                        break
-                    time.sleep(0.1)
+                proc.terminate()
+                proc.wait(timeout=3)
             except Exception:
                 pass
-            try:
-                self.state.process.terminate()
-            except Exception:
-                pass
-        # Restore audio
         self._restore_audio()
-        self.state = LockState()
+        if snooze and reason == 'schedule':
+            try:
+                snooze_current_window()
+            except Exception as e:
+                print(f'[locker] snooze failed: {e}')
 
-
-
-def scheduler_loop(locker: Locker):
-    while True:
-        from schedule_store import read_schedule
-        sched = read_schedule()
-        if not bool(sched.get('enabled', False)):
-            time.sleep(1)
-            continue
-        try:
-            start = dtime.fromisoformat(sched.get('start', '22:00'))
-            end = dtime.fromisoformat(sched.get('end', '07:00'))
-        except Exception:
-            time.sleep(5)
-            continue
-        now = datetime.now()
-        should_lock = in_lock_window(now, start, end)
-        if should_lock and not locker.state.active:
-            locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
-        elif not should_lock and locker.state.active:
-            locker.unlock_now()
-        time.sleep(1)
-
-
-def lock_if_in_schedule_now(locker: Locker):
-    from schedule_store import read_schedule
-    sched = read_schedule()
-    if not bool(sched.get('enabled', False)):
-        return
-    try:
-        start = dtime.fromisoformat(sched.get('start', '22:00'))
-        end = dtime.fromisoformat(sched.get('end', '07:00'))
-    except Exception:
-        return
-    if in_lock_window(datetime.now(), start, end):
-        locker.lock_now(reason='schedule', start=start.isoformat(timespec='minutes'), end=end.isoformat(timespec='minutes'))
-
+    def status(self) -> dict:
+        s = self.state
+        return {
+            "locked": bool(s.active),
+            "reason": s.reason,
+            "since": s.since.isoformat(timespec='seconds') if s.since else None,
+        }
 
 
 def _ensure_single_instance():
     """Ensure only one scheduler/GUI instance runs. Lock screen child is exempt.
-    Uses a named global mutex via Win32 API to avoid pywin32 dependency issues in packaged exe.
+    A second launch signals the running one (via a named event) to show its window, then exits.
     """
     try:
         import ctypes
         from ctypes import wintypes
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        user32 = ctypes.WinDLL('user32', use_last_error=True)
-        CreateMutexW = kernel32.CreateMutexW
-        CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
-        CreateMutexW.restype = wintypes.HANDLE
-        GetLastError = kernel32.GetLastError
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
         ERROR_ALREADY_EXISTS = 183
-        # Create a global mutex
-        name = 'Global\\PC_LOCK_SINGLETON'
-        hmutex = CreateMutexW(None, True, name)
+        hmutex = kernel32.CreateMutexW(None, True, 'Global\\PC_LOCK_SINGLETON')
         if not hmutex:
             return None
-        if GetLastError() == ERROR_ALREADY_EXISTS:
-            # Another instance is running – try to bring it to front
-            try:
-                FindWindowW = user32.FindWindowW
-                ShowWindow = user32.ShowWindow
-                SetForegroundWindow = user32.SetForegroundWindow
-                SW_SHOW = 5
-                hwnd = FindWindowW(None, 'PC Lock')
-                if hwnd:
-                    ShowWindow(hwnd, SW_SHOW)
-                    SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            from single_instance import signal_show
+            signal_show()
             sys.exit(0)
         # Keep handle referenced so mutex stays held
         return hmutex
+    except SystemExit:
+        raise
     except Exception:
         return None
 
@@ -315,16 +280,17 @@ def main():
 
     if args.install_startup:
         install_startup()
+        print('Installed startup entry in HKCU Run.')
         return
 
     if args.uninstall_startup:
         uninstall_startup()
+        print('Removed startup entry from HKCU Run.')
         return
 
     # If packaged exe is invoked in lockscreen mode, run lockscreen now
     if args.mode == 'lockscreen':
         import lockscreen as _lock
-        # Reuse parsed args for consistency
         sys.argv = [sys.argv[0], '--desktop-name', args.desktop_name, '--reason', args.reason] + ([] if not args.start or not args.end else ['--start', args.start, '--end', args.end])
         _lock.main()
         return
@@ -332,41 +298,30 @@ def main():
     # Single-instance guard (scheduler/GUI only)
     _ensure_single_instance()
 
-    # If running as packaged exe, default to GUI manager
-    if getattr(_sys, 'frozen', False) and args.mode == 'scheduler' and not args.lock_now:
-        import ui as _ui
-        _ui.main()
-        return
-
-    # UI mode if requested (dev mode)
-    if args.ui:
+    # GUI: default for the packaged exe, or with --ui
+    if args.ui or (getattr(sys, 'frozen', False) and not args.lock_now):
         import ui as _ui
         _ui.main()
         return
 
     locker = Locker()
-
-    # Start REST API if enabled in config
-    api_server = maybe_start_api(locker)
-
-    # Lock immediately if we're currently inside the scheduled window
-    lock_if_in_schedule_now(locker)
+    try:
+        maybe_start_api(locker)
+    except OSError as e:
+        print(f'API server not started: {e}')
+    scheduler = SchedulerThread(locker)
+    scheduler.start()
 
     if args.lock_now:
         locker.lock_now()
-        # Keep parent alive to allow CTRL+C and for schedule to potentially unlock
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            locker.unlock_now()
-            return
 
     print('PC Lock scheduler running. Press Ctrl+C to exit.')
     try:
-        scheduler_loop(locker)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        locker.unlock_now()
+        scheduler.stop()
+        locker.unlock_now(snooze=False)
         print('Exiting.')
 
 

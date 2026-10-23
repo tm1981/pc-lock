@@ -33,7 +33,12 @@
 
 | Command | Result |
 |---------|--------|
-| `python ui.py` | GUI with tray |
+| `python main.py --ui` | GUI with tray |
 | `python main.py` | Console scheduler |
 | `python main.py --lock-now` | Immediate lock |
 | `pclock.exe` (built) | GUI mode (default) |
+| `python -m pytest tests` | Logic/API tests (temp data dir) |
+
+## Companion
+
+A separate Next.js web UI controls the app through the REST API (not in this repo).

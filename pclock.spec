@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import customtkinter
+
+CTK_DIR = os.path.dirname(customtkinter.__file__)
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/pclock.ico', 'assets'), ('C:/Users/tm81/miniconda3/Lib/site-packages/customtkinter', 'customtkinter')],
+    datas=[('assets/pclock.ico', 'assets'), (CTK_DIR, 'customtkinter')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
