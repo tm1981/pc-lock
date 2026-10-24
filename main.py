@@ -114,7 +114,7 @@ class LockState:
 
 
 class Locker:
-    MAX_RESPAWNS = 3  # lock screen crashes tolerated per lock before giving up
+    MAX_RESPAWN_DELAY = 30.0  # seconds; lock screen restarts back off up to this
 
     def __init__(self):
         self.state = LockState()
@@ -158,22 +158,30 @@ class Locker:
         flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
         return subprocess.Popen(cmd, creationflags=flags)
 
+    def _respawn_delay(self, respawns: int) -> float:
+        return 0.0 if respawns == 0 else min(self.MAX_RESPAWN_DELAY, 0.5 * 2 ** respawns)
+
     def _watch_child(self, proc: subprocess.Popen, respawns: int):
         code = proc.wait()
+        # Fail closed: only exit code 0 (correct password on the lock screen) ends the lock.
+        # Crash / Alt+F4 / failed spawn: keep restarting the lock screen with backoff, forever.
+        while code != 0:
+            print(f'[locker] lock screen exited with {code}; restarting')
+            time.sleep(self._respawn_delay(respawns))
+            respawns += 1
+            with self._mutex:
+                if self.state.process is not proc:
+                    return  # unlocked meanwhile via unlock_now
+                try:
+                    proc = self._spawn(self.state.reason, self.state.start, self.state.end)
+                    self.state.process = proc
+                except Exception as e:
+                    print(f'[locker] respawn failed: {e}')
+                    continue  # still locked; the desktop stays on LockDesktop
+            code = proc.wait()
         with self._mutex:
             if self.state.process is not proc:
                 return  # we ended this lock ourselves (unlock_now)
-            if code != 0 and respawns < self.MAX_RESPAWNS:
-                # Lock screen crashed: bring it back instead of leaving the PC unlocked
-                print(f'[locker] lock screen exited with {code}; restarting')
-                try:
-                    new = self._spawn(self.state.reason, self.state.start, self.state.end)
-                    self.state.process = new
-                    threading.Thread(target=self._watch_child, args=(new, respawns + 1), daemon=True).start()
-                    return
-                except Exception as e:
-                    print(f'[locker] respawn failed: {e}')
-            # Unlocked with the password on the lock screen (exit code 0), or gave up respawning
             reason = self.state.reason
             self.state = LockState()
         _switch_to_default_desktop()  # never leave the user on an empty lock desktop

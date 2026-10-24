@@ -18,16 +18,18 @@ class _AuthLimiter:
         self._lock = threading.Lock()
         self._fails: dict[str, list[float]] = {}
 
-    def blocked(self, ip: str) -> bool:
+    def reserve(self, ip: str) -> bool:
+        """Atomically count this attempt as a failure up front (so parallel requests can't
+        slip past the limit). Returns False when the IP is blocked. Call reset() on success."""
         now = time.monotonic()
         with self._lock:
             recent = [t for t in self._fails.get(ip, []) if now - t < AUTH_BLOCK_SECONDS]
+            if len(recent) >= MAX_AUTH_FAILS:
+                self._fails[ip] = recent
+                return False
+            recent.append(now)
             self._fails[ip] = recent
-            return len(recent) >= MAX_AUTH_FAILS
-
-    def fail(self, ip: str):
-        with self._lock:
-            self._fails.setdefault(ip, []).append(time.monotonic())
+            return True
 
     def reset(self, ip: str):
         with self._lock:
@@ -42,9 +44,14 @@ def schedule_payload() -> dict:
     return sched
 
 
+LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+
+
 class _Handler(BaseHTTPRequestHandler):
     locker = None  # injected
     limiter: _AuthLimiter = None  # injected
+    bind_host = '127.0.0.1'  # injected
+    cors_origins: frozenset = frozenset()  # injected; empty = no CORS (server-side callers only)
 
     def _route(self) -> str:
         return urlsplit(self.path).path.rstrip('/') or '/'
@@ -67,7 +74,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _auth(self, body: dict) -> bool:
         """Allow Authorization: Bearer <password> OR JSON {"password":"..."}. Sends the error response."""
         ip = self.client_address[0]
-        if self.limiter.blocked(ip):
+        if not self.limiter.reserve(ip):
             self._json_response(429, {"error": "too_many_attempts", "retry_after": AUTH_BLOCK_SECONDS})
             return False
         auth = self.headers.get('Authorization') or ''
@@ -78,15 +85,31 @@ class _Handler(BaseHTTPRequestHandler):
         if isinstance(pw, str) and pw and _verify_password(pw):
             self.limiter.reset(ip)
             return True
-        self.limiter.fail(ip)
         self._json_response(401, {"error": "unauthorized"})
         return False
 
+    def _request_allowed(self) -> bool:
+        """Block DNS rebinding (localhost-bound server reached via a foreign Host name) and
+        browser requests from origins that aren't explicitly allowed. Sends the error response."""
+        if self.bind_host in LOCAL_HOSTS:
+            host = (self.headers.get('Host') or '').rsplit(':', 1)[0].strip('[]').lower()
+            if host not in LOCAL_HOSTS:
+                self._json_response(403, {"error": "forbidden_host"})
+                return False
+        origin = self.headers.get('Origin')
+        if origin and origin.rstrip('/') not in self.cors_origins:
+            self._json_response(403, {"error": "forbidden_origin"})
+            return False
+        return True
+
     def _cors_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        self.send_header('Access-Control-Max-Age', '600')
+        origin = (self.headers.get('Origin') or '').rstrip('/')
+        if origin and origin in self.cors_origins:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Vary', 'Origin')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            self.send_header('Access-Control-Max-Age', '600')
 
     def _json_response(self, code: int, payload: dict):
         b = json.dumps(payload).encode('utf-8')
@@ -98,25 +121,39 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _status(self) -> dict:
+    def _status(self, with_schedule: bool) -> dict:
         st = self.locker.status() if self.locker else {"locked": False, "reason": None, "since": None}
-        st["schedule"] = schedule_payload()
+        if with_schedule:
+            st["schedule"] = schedule_payload()
         return st
 
     def do_OPTIONS(self):
+        if not self._request_allowed():
+            return
         self.send_response(204)
         self._cors_headers()
         self.end_headers()
 
     def do_GET(self):
+        if not self._request_allowed():
+            return
         route = self._route()
         if route == '/api/status':
-            return self._json_response(200, self._status())
+            # Lock state is public (used as an "online" check); schedule details need auth
+            if self.headers.get('Authorization'):
+                if not self._auth({}):
+                    return
+                return self._json_response(200, self._status(True))
+            return self._json_response(200, self._status(False))
         if route == '/api/schedule':
+            if not self._auth({}):
+                return
             return self._json_response(200, {"schedule": schedule_payload()})
         return self._json_response(404, {"error": "not_found"})
 
     def do_POST(self):
+        if not self._request_allowed():
+            return
         route = self._route()
         if route not in ('/api/lock', '/api/unlock', '/api/schedule'):
             return self._json_response(404, {"error": "not_found"})
@@ -129,11 +166,11 @@ class _Handler(BaseHTTPRequestHandler):
             if route == '/api/lock':
                 if self.locker:
                     self.locker.lock_now(reason='manual')
-                return self._json_response(200, {"status": "locked", **self._status()})
+                return self._json_response(200, {"status": "locked", **self._status(True)})
             if route == '/api/unlock':
                 if self.locker:
                     self.locker.unlock_now()
-                return self._json_response(200, {"status": "unlocked", **self._status()})
+                return self._json_response(200, {"status": "unlocked", **self._status(True)})
         except Exception as e:
             return self._json_response(500, {"error": str(e)})
 
@@ -166,11 +203,14 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class ApiServer:
-    def __init__(self, locker, host: str = '127.0.0.1', port: int = 8765):
+    def __init__(self, locker, host: str = '127.0.0.1', port: int = 8765, cors_origins=()):
         self.locker = locker
         self.host = host
         self.port = int(port)
-        handler = type('InjectedHandler', (_Handler,), {'locker': locker, 'limiter': _AuthLimiter()})
+        handler = type('InjectedHandler', (_Handler,), {
+            'locker': locker, 'limiter': _AuthLimiter(), 'bind_host': host,
+            'cors_origins': frozenset(o.rstrip('/') for o in cors_origins),
+        })
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self.httpd.daemon_threads = True
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name='pclock-api')
@@ -196,4 +236,7 @@ def maybe_start_api(locker):
     api_cfg = cfg.get('api', {})
     if not api_cfg.get('enabled'):
         return None
-    return ApiServer(locker, api_cfg.get('host', '127.0.0.1'), int(api_cfg.get('port', 8765))).start()
+    # Optional "cors_origins": ["http://..."] in config.json for browser callers; default none
+    origins = api_cfg.get('cors_origins')
+    return ApiServer(locker, api_cfg.get('host', '127.0.0.1'), int(api_cfg.get('port', 8765)),
+                     origins if isinstance(origins, list) else []).start()

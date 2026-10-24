@@ -128,12 +128,13 @@ Named auto-reset event `Local\PC_LOCK_SHOW_WINDOW`: `signal_show()`, `show_reque
 ---
 
 ## api.py
-**REST API** (ThreadingHTTPServer; CORS headers on every response; per-IP auth throttle 5 fails/60s -> 429)
+**REST API** (ThreadingHTTPServer; per-IP auth throttle 5 attempts/60s reserved atomically -> 429;
+no CORS unless `api.cors_origins` allowlist; foreign Origin -> 403; Host check when bound to localhost)
 
 | Endpoint | Method | Auth | Response |
 |----------|--------|------|----------|
-| `/api/status` | GET | No | `{locked, reason, since, schedule}` |
-| `/api/schedule` | GET | No | `{schedule}` |
+| `/api/status` | GET | No (Bearer adds `schedule`) | `{locked, reason, since, schedule?}` |
+| `/api/schedule` | GET | Yes | `{schedule}` |
 | `/api/lock` | POST | Yes | `{status: "locked", ...}` |
 | `/api/unlock` | POST | Yes | `{status: "unlocked", ...}` (snoozes the scheduled window) |
 | `/api/schedule` | POST | Yes | partial update; clears snooze |

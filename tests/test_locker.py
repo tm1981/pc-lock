@@ -79,9 +79,13 @@ def test_crashed_lockscreen_is_restarted(monkeypatch):
     procs[0].exit(3)  # crash / Alt+F4: must not count as unlock
     assert wait_until(lambda: len(procs) == 2)
     assert locker.state.active and locker.state.process is procs[1]
-    # After too many crashes it gives up and returns to the normal desktop instead of a black screen
-    for i in range(1, Locker.MAX_RESPAWNS + 1):
-        assert wait_until(lambda: len(procs) > i)
+    # Fail closed: repeated crashes keep it locked, never switch back to the normal desktop
+    for i in range(1, 4):
+        assert wait_until(lambda: len(procs) > i, timeout=10)
         procs[i].exit(3)
+    assert wait_until(lambda: len(procs) == 5, timeout=10)
+    assert locker.state.active and not switches
+    # Correct password on the restarted lock screen ends it normally
+    procs[4].exit(0)
     assert wait_until(lambda: not locker.state.active)
     assert switches

@@ -77,14 +77,14 @@ If enabled in `config.json` (`api.enabled: true`), a local REST server starts.
 - Default base URL: http://127.0.0.1:8765
 - Auth: provide the configured unlock password either as JSON `{ "password": "..." }` in the request body, or as `Authorization: Bearer <password>` header.
 
-All responses include CORS headers, so a browser app (e.g. the Next.js web UI) can call the API directly.
+The Next.js web UI calls the API from its server, so no CORS is needed. Browser requests carrying an `Origin` are rejected unless that origin is listed in `api.cors_origins` in `config.json`. When bound to localhost, requests with a foreign `Host` header are rejected (DNS-rebinding protection).
 After 5 wrong passwords from one IP within 60s, auth endpoints answer `429` for 60s.
 
 Endpoints:
-- GET /api/status (no auth)
-  - Response: `{ "locked": bool, "reason": "manual"|"schedule"|null, "since": "ISO"|null, "schedule": {...} }`
+- GET /api/status (no auth; send `Authorization: Bearer` to also get `schedule`)
+  - Response: `{ "locked": bool, "reason": "manual"|"schedule"|null, "since": "ISO"|null, "schedule"?: {...} }`
 
-- GET /api/schedule (no auth)
+- GET /api/schedule (auth: Bearer)
   - Response: `{ "schedule": { "enabled", "start", "end", "notify_minutes", "snooze_until", "snoozed" } }`
 
 - POST /api/lock

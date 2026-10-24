@@ -24,8 +24,8 @@ B) unlock_now()  (API / scheduler at window end / Ctrl+C)
      terminate child, restore audio, snooze if reason == 'schedule' and snooze=True
 
 C) Lock screen crashes / Alt+F4 / mainloop ends -> exit code != 0
-     watcher respawns lock screen (max 3 per lock), then gives up and
-     switches back to Default so the user is never stuck on an empty desktop
+     watcher respawns lock screen forever with backoff (0, 1, 2, 4 ... 30s).
+     Fail closed: only exit code 0 ends the lock.
 ```
 
 ## Schedule Check (scheduler.SchedulerThread, 1s, used by GUI AND console)

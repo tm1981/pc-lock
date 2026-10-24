@@ -62,8 +62,9 @@ WinSta0 (Window Station)
 | **Binding** | localhost (`127.0.0.1`) by default |
 | **Auth** | Same password as unlock |
 | **Methods** | Bearer token OR JSON body |
-| **CORS** | `*` on every response (browser web UI can call it) |
-| **Throttle** | 5 failed auths per IP in 60s → 429 for 60s |
+| **CORS** | None by default; optional `api.cors_origins` allowlist; foreign Origin -> 403 |
+| **Host check** | Localhost-bound server rejects foreign Host headers (DNS rebinding) |
+| **Throttle** | 5 auth attempts per IP in 60s, reserved atomically → 429 for 60s |
 
 **Warning**: Do not expose API on `0.0.0.0` without understanding risks.
 

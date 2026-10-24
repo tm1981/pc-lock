@@ -43,12 +43,40 @@ def call(srv, method, path, body=None, headers=None, raw=None):
         return e.code, dict(e.headers), json.loads(e.read() or b'{}')
 
 
-def test_cors_on_every_response(server):
+def test_no_cors_by_default_and_foreign_origins_rejected(server):
     code, headers, body = call(server, 'GET', '/api/status')
-    assert code == 200 and headers['Access-Control-Allow-Origin'] == '*'
-    assert body['locked'] is False and 'schedule' in body
-    code, headers, _ = call(server, 'POST', '/api/lock', {'password': 'nope'})
-    assert code == 401 and headers['Access-Control-Allow-Origin'] == '*'
+    assert code == 200 and 'Access-Control-Allow-Origin' not in headers
+    assert body['locked'] is False and 'schedule' not in body  # schedule needs auth
+    assert call(server, 'POST', '/api/lock', {'password': 'secret1'}, {'Origin': 'https://evil.example'})[0] == 403
+
+
+def test_allowlisted_origin_gets_cors():
+    set_password('secret1')
+    srv = api.ApiServer(FakeLocker(), '127.0.0.1', 0, cors_origins=['http://pc-control.lan:3000']).start()
+    srv.base = f'http://127.0.0.1:{srv.httpd.server_address[1]}'
+    try:
+        code, headers, _ = call(srv, 'GET', '/api/status', headers={'Origin': 'http://pc-control.lan:3000'})
+        assert code == 200 and headers['Access-Control-Allow-Origin'] == 'http://pc-control.lan:3000'
+    finally:
+        srv.stop()
+
+
+def test_dns_rebinding_host_rejected(server):
+    assert call(server, 'GET', '/api/status', headers={'Host': 'attacker.example'})[0] == 403
+
+
+def test_schedule_reads_need_auth(server):
+    assert call(server, 'GET', '/api/schedule')[0] == 401
+    code, _, body = call(server, 'GET', '/api/status', headers={'Authorization': 'Bearer secret1'})
+    assert code == 200 and 'schedule' in body
+    assert call(server, 'GET', '/api/schedule', headers={'Authorization': 'Bearer secret1'})[0] == 200
+
+
+def test_parallel_guesses_cannot_exceed_limit(server):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(20) as ex:
+        codes = list(ex.map(lambda _: call(server, 'POST', '/api/lock', {'password': 'x'})[0], range(20)))
+    assert codes.count(401) == api.MAX_AUTH_FAILS and codes.count(429) == 20 - api.MAX_AUTH_FAILS
 
 
 def test_lock_unlock_with_bearer(server):
